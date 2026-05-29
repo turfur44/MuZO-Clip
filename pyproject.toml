@@ -9,7 +9,17 @@ description = "Experimental Muon-style zeroth-order optimizer with optional QK-C
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy",
     "torch",
+]
+
+[project.optional-dependencies]
+train = [
+    "transformers",
+    "pyarrow",
+]
+profile = [
+    "tensorboard",
 ]
 
 [tool.setuptools.packages.find]

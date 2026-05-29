@@ -17,6 +17,8 @@ from typing import Callable, Iterable
 
 import torch
 
+from .block_config import BlockRows, resolve_block_rows
+from .fastpath import FastPathBackend, require_supported_backend
 from .newton_schulz import zeropower_via_newtonschulz5
 from .parameter_filter import (
     DEFAULT_FROZEN_SUBSTRINGS,
@@ -24,8 +26,10 @@ from .parameter_filter import (
     SelectedParameter,
     select_muzo_parameters,
 )
+from .profiling import PhaseProfiler, null_phase_profiler
 from .prng import NoiseDistribution, iter_param_blocks, make_zo_noise_like
 from .qk_clip import QKClipApplyStats, QKClipController
+from .sparse_schedule import SparseUpdateMode, names_hash, select_active_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ class HistoryItem:
     p_raw: float
     loss_plus: float
     loss_minus: float
+    active_param_names: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -56,6 +61,8 @@ class StepStats:
     update_rms_mean: float
     update_ratio_max: float
     updated_param_count: int
+    active_param_count: int
+    active_param_names_hash: str
     skipped: bool
     skip_reason: str | None
 
@@ -91,7 +98,7 @@ class MuZOClipOptimizer:
         p_ema_beta: float = 0.95,
         update_ratio_clip: float = 0.01,
         distribution: NoiseDistribution = "normal",
-        block_rows: int | None = None,
+        block_rows: BlockRows = None,
         seed: int = 1,
         rollback: bool = False,
         restore_exact: bool = False,
@@ -105,6 +112,10 @@ class MuZOClipOptimizer:
         qk_capture_clean_forward: bool = False,
         qk_clip_tau: float = 100.0,
         qk_clip_alpha: float = 0.5,
+        phase_profiler: PhaseProfiler | None = None,
+        fast_path_backend: FastPathBackend = "torch",
+        sparse_update_mode: SparseUpdateMode = "off",
+        sparse_update_groups: int = 1,
     ):
         if horizon <= 0:
             raise ValueError("horizon must be positive")
@@ -120,6 +131,9 @@ class MuZOClipOptimizer:
             raise ValueError("muon_scale must be positive")
         if distribution not in ("normal", "rademacher"):
             raise ValueError(f"Unsupported distribution: {distribution}")
+        if sparse_update_groups <= 0:
+            raise ValueError("sparse_update_groups must be positive")
+        require_supported_backend(fast_path_backend, distribution)
 
         self.model = model
         self.lr = float(lr)
@@ -133,6 +147,7 @@ class MuZOClipOptimizer:
         self.update_ratio_clip = float(update_ratio_clip)
         self.distribution = distribution
         self.block_rows = block_rows
+        self.fast_path_backend = fast_path_backend
         self.rollback = bool(rollback)
         self.restore_exact = bool(restore_exact)
         self.min_history = int(min_history)
@@ -140,6 +155,9 @@ class MuZOClipOptimizer:
         self.normalize_momentum = bool(normalize_momentum)
         self.muon_scale = float(muon_scale)
         self.qk_capture_clean_forward = bool(qk_capture_clean_forward)
+        self.phase_profiler = phase_profiler or null_phase_profiler()
+        self.sparse_update_mode = sparse_update_mode
+        self.sparse_update_groups = int(sparse_update_groups)
 
         self.selected_params: list[SelectedParameter] = select_muzo_parameters(
             model,
@@ -167,6 +185,9 @@ class MuZOClipOptimizer:
         self._rng = random.Random(int(seed))
         self._has_pending_update = False
         self._last_step_updated = False
+        self._projection_index = 0
+        self._pending_active_params: list[SelectedParameter] = self.selected_params
+        self._pending_active_names: tuple[str, ...] | None = None
 
         self.qk_clip: QKClipController | None = None
         if enable_qk_clip:
@@ -178,6 +199,9 @@ class MuZOClipOptimizer:
 
     def selected_parameter_names(self) -> list[str]:
         return [item.name for item in self.selected_params]
+
+    def active_parameter_names(self) -> list[str]:
+        return [item.name for item in self._pending_active_params]
 
     def persistent_tensor_state(self) -> list[torch.Tensor]:
         """Return persistent non-parameter tensors owned by the optimizer."""
@@ -193,22 +217,37 @@ class MuZOClipOptimizer:
 
         seed = self._sample_seed()
         self._clear_qk_clip_capture()
+        self._projection_index += 1
+        active_params = select_active_parameters(
+            self.selected_params,
+            mode=self.sparse_update_mode,
+            groups=self.sparse_update_groups,
+            step_index=self._projection_index - 1,
+        )
+        self._pending_active_params = active_params
+        active_names = tuple(item.name for item in active_params)
+        self._pending_active_names = None if active_params is self.selected_params else active_names
         snapshot = self._snapshot_selected_params() if self.rollback or self.restore_exact else None
         displacement = 0
 
         try:
-            self._perturb_selected(seed, scaling_factor=1.0)
+            with self._phase("perturb_plus"):
+                self._perturb_selected(seed, scaling_factor=1.0, selected_params=active_params)
             displacement = 1
-            loss_plus = self._call_loss(loss_closure)
+            with self._phase("forward_plus"):
+                loss_plus = self._call_loss(loss_closure)
 
-            self._perturb_selected(seed, scaling_factor=-2.0)
+            with self._phase("perturb_minus"):
+                self._perturb_selected(seed, scaling_factor=-2.0, selected_params=active_params)
             displacement = -1
-            loss_minus = self._call_loss(loss_closure)
+            with self._phase("forward_minus"):
+                loss_minus = self._call_loss(loss_closure)
 
-            if self.restore_exact and snapshot is not None:
-                self._restore_snapshot(snapshot)
-            else:
-                self._perturb_selected(seed, scaling_factor=1.0)
+            with self._phase("restore"):
+                if self.restore_exact and snapshot is not None:
+                    self._restore_snapshot(snapshot)
+                else:
+                    self._perturb_selected(seed, scaling_factor=1.0, selected_params=active_params)
             displacement = 0
         except Exception:
             self._restore_after_failed_projection(seed, displacement, snapshot)
@@ -249,6 +288,7 @@ class MuZOClipOptimizer:
                 p_raw=float(p_raw),
                 loss_plus=float(loss_plus),
                 loss_minus=float(loss_minus),
+                active_param_names=self._pending_active_names,
             )
         )
         self._has_pending_update = True
@@ -279,6 +319,8 @@ class MuZOClipOptimizer:
                 update_rms_mean=0.0,
                 update_ratio_max=0.0,
                 updated_param_count=0,
+                active_param_count=0,
+                active_param_names_hash="",
                 skipped=True,
                 skip_reason="no successful pending projection",
             ).__dict__
@@ -291,6 +333,8 @@ class MuZOClipOptimizer:
                 update_rms_mean=0.0,
                 update_ratio_max=0.0,
                 updated_param_count=0,
+                active_param_count=0,
+                active_param_names_hash="",
                 skipped=True,
                 skip_reason="empty projection history",
             ).__dict__
@@ -303,6 +347,8 @@ class MuZOClipOptimizer:
                 update_rms_mean=0.0,
                 update_ratio_max=0.0,
                 updated_param_count=0,
+                active_param_count=0,
+                active_param_names_hash="",
                 skipped=True,
                 skip_reason=f"waiting for min_history={self.min_history}",
             ).__dict__
@@ -311,46 +357,57 @@ class MuZOClipOptimizer:
         update_rms_values: list[float] = []
         update_ratio_max = 0.0
         updated_param_count = 0
+        active_params = self._pending_active_params
+        active_names = [item.name for item in active_params]
+        active_names_set = set(active_names)
 
-        for selected in self.selected_params:
+        for selected in active_params:
             param = selected.param
-            for block_index, _, block in iter_param_blocks(param.data, self.block_rows):
-                M = torch.zeros(block.shape, device=block.device, dtype=torch.float32)
-                coeff_sum = 0.0
-                for age, item in enumerate(reversed(self.history)):
-                    coeff = self.beta_momentum**age
-                    noise = make_zo_noise_like(
-                        block,
-                        item.seed,
-                        selected.name,
-                        block_index=block_index,
-                        distribution=self.distribution,
-                    ).float()
-                    M.add_(noise, alpha=coeff * item.p)
-                    coeff_sum += coeff
+            block_rows = resolve_block_rows(param.data, self.block_rows)
+            for block_index, _, block in iter_param_blocks(param.data, block_rows):
+                with self._phase("muzo_reconstruct"):
+                    M = torch.zeros(block.shape, device=block.device, dtype=torch.float32)
+                    coeff_sum = 0.0
+                    for age, item in enumerate(reversed(self.history)):
+                        if item.active_param_names is not None and selected.name not in item.active_param_names:
+                            continue
+                        coeff = self.beta_momentum**age
+                        noise = make_zo_noise_like(
+                            block,
+                            item.seed,
+                            selected.name,
+                            block_index=block_index,
+                            distribution=self.distribution,
+                        ).float()
+                        M.add_(noise, alpha=coeff * item.p)
+                        coeff_sum += coeff
 
                 if self.normalize_momentum and coeff_sum > 0:
                     M.div_(coeff_sum)
+                if coeff_sum <= 0:
+                    del M
+                    continue
 
-                U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
+                with self._phase("newton_schulz"):
+                    U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
                 if not bool(torch.isfinite(U.float()).all().item()):
                     logger.warning("Skipping non-finite MuZO update for %s block %d", selected.name, block_index)
                     continue
 
-                U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
-
-                update_rms = _rms(U) * lr
-                weight_rms = _rms(block)
-                ratio = update_rms / (weight_rms + 1e-12)
-                ratio_float = float(ratio.item())
-                if ratio_float > self.update_ratio_clip:
-                    U.mul_(self.update_ratio_clip / ratio_float)
+                with self._phase("apply_update"):
+                    U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
                     update_rms = _rms(U) * lr
-                    ratio_float = float((update_rms / (weight_rms + 1e-12)).item())
+                    weight_rms = _rms(block)
+                    ratio = update_rms / (weight_rms + 1e-12)
+                    ratio_float = float(ratio.item())
+                    if ratio_float > self.update_ratio_clip:
+                        U.mul_(self.update_ratio_clip / ratio_float)
+                        update_rms = _rms(U) * lr
+                        ratio_float = float((update_rms / (weight_rms + 1e-12)).item())
 
-                block.add_(U.to(dtype=block.dtype), alpha=-lr)
-                if self.weight_decay:
-                    block.mul_(1.0 - lr * self.weight_decay)
+                    block.add_(U.to(dtype=block.dtype), alpha=-lr)
+                    if self.weight_decay:
+                        block.mul_(1.0 - lr * self.weight_decay)
 
                 update_rms_values.append(float(update_rms.item()))
                 update_ratio_max = max(update_ratio_max, ratio_float)
@@ -366,6 +423,8 @@ class MuZOClipOptimizer:
             update_rms_mean=mean_update_rms,
             update_ratio_max=update_ratio_max,
             updated_param_count=updated_param_count,
+            active_param_count=len(active_names_set),
+            active_param_names_hash=names_hash(active_names),
             skipped=False,
             skip_reason=None,
         ).__dict__
@@ -423,7 +482,8 @@ class MuZOClipOptimizer:
         def wrapped_forward() -> float:
             return self._call_loss(clean_forward_closure)
 
-        return self.qk_clip.probe(wrapped_forward, force_eager=force_eager).__dict__
+        with self._phase("qk_probe"):
+            return self.qk_clip.probe(wrapped_forward, force_eager=force_eager).__dict__
 
     def _sample_seed(self) -> int:
         return self._rng.randrange(0, (1 << 63) - 1)
@@ -432,10 +492,17 @@ class MuZOClipOptimizer:
         return any(selected.param.dtype in (torch.float16, torch.bfloat16) for selected in self.selected_params)
 
     @torch.no_grad()
-    def _perturb_selected(self, seed: int, scaling_factor: float) -> None:
+    def _perturb_selected(
+        self,
+        seed: int,
+        scaling_factor: float,
+        selected_params: list[SelectedParameter] | None = None,
+    ) -> None:
         scale = float(scaling_factor) * self.zo_eps
-        for selected in self.selected_params:
-            for block_index, _, block in iter_param_blocks(selected.param.data, self.block_rows):
+        selected_items = selected_params if selected_params is not None else self.selected_params
+        for selected in selected_items:
+            block_rows = resolve_block_rows(selected.param.data, self.block_rows)
+            for block_index, _, block in iter_param_blocks(selected.param.data, block_rows):
                 noise = make_zo_noise_like(
                     block,
                     seed,
@@ -444,6 +511,11 @@ class MuZOClipOptimizer:
                     distribution=self.distribution,
                 )
                 block.add_(noise, alpha=scale)
+
+    @contextlib.contextmanager
+    def _phase(self, name: str):
+        with self.phase_profiler.phase(name):
+            yield
 
     def _call_loss(self, loss_closure: Callable[[], torch.Tensor | float | object]) -> float:
         self.model.eval()
@@ -497,9 +569,9 @@ class MuZOClipOptimizer:
         if snapshot is not None:
             self._restore_snapshot(snapshot)
         elif displacement == 1:
-            self._perturb_selected(seed, scaling_factor=-1.0)
+            self._perturb_selected(seed, scaling_factor=-1.0, selected_params=self._pending_active_params)
         elif displacement == -1:
-            self._perturb_selected(seed, scaling_factor=1.0)
+            self._perturb_selected(seed, scaling_factor=1.0, selected_params=self._pending_active_params)
         if self.qk_clip is not None:
             self.qk_clip.clear()
 

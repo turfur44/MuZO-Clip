@@ -208,6 +208,60 @@ if global_step % 50 == 0:
 Training scripts must provide the loss closure, batching, checkpointing, logging,
 and optional assistant-only label masking.
 
+## Performance Experiments
+
+The `scripts/` folder contains opt-in experimental tooling for profiling and
+throughput work. Defaults keep the reference behavior.
+
+Pretokenize a ChatML/text dataset once:
+
+```bash
+python scripts/pretokenize_dataset.py \
+  --tokenizer_name modelscope_models/OpenBMB/MiniCPM5-1B-Base \
+  --data_path final_train_v3_200m_text_only.parquet \
+  --text_column text \
+  --seq_len 1024 \
+  --loss_mode assistant_only \
+  --token_cache_root token_cache
+```
+
+Use the cache in training:
+
+```bash
+python scripts/train_muzo_clip.py \
+  --model_name modelscope_models/OpenBMB/MiniCPM5-1B-Base \
+  --tokenizer_name modelscope_models/OpenBMB/MiniCPM5-1B-Base \
+  --data_path final_train_v3_200m_text_only.parquet \
+  --seq_len 1024 \
+  --batch_size 4 \
+  --token_cache_mode require \
+  --token_cache_root token_cache \
+  --qk_clip_mode none
+```
+
+Optional profiling flags:
+
+```text
+--profile_phases
+--profile_phase_csv outputs/phase_times.csv
+--profile_nvtx
+--torch_profile
+--torch_profile_dir profiler_traces
+```
+
+Optional fast-path experiment flags:
+
+```text
+--block_rows auto
+--distribution rademacher
+--fast_path_backend torch
+--sparse_update_mode round_robin
+--sparse_update_groups 4
+```
+
+`--fast_path_backend fused_rademacher` is scaffolded but intentionally raises
+until the Triton/CUDA kernels are implemented and tested.
+
 ## Important Defaults
 
 ```text
