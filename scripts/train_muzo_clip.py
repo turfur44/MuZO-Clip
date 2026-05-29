@@ -13,9 +13,12 @@ import json
 import logging
 import random
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Iterator
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -423,4 +426,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
