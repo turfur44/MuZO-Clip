@@ -188,7 +188,8 @@ class QKClipController:
         module_name = self._module_stack[-1]
         with torch.no_grad():
             logits = input_tensor.detach()
-            if not bool(torch.isfinite(logits).any().item()):
+            if not bool(torch.isfinite(logits).all().item()):
+                logger.warning("QK-Clip skipped non-finite logits for %s", module_name)
                 return
             per_head = logits.float().amax(dim=(0, 2, 3)).cpu()
             previous = self._captured_smax.get(module_name)
