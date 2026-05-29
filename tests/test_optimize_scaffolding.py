@@ -66,10 +66,11 @@ def test_sparse_round_robin_covers_all_params() -> None:
     assert names_hash([item.name for item in params]) == names_hash([item.name for item in params])
 
 
-def test_fused_rademacher_scaffold_is_opt_in() -> None:
+def test_fused_rademacher_backend_is_opt_in() -> None:
     require_supported_backend("torch", "normal")
     with pytest.raises(ValueError):
         require_supported_backend("fused_rademacher", "normal")
-    with pytest.raises(NotImplementedError):
+    try:
         require_supported_backend("fused_rademacher", "rademacher")
-
+    except ImportError:
+        pytest.skip("Triton is not installed")

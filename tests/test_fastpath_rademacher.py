@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import importlib.util
+
+import pytest
+import torch
+
+from muzo_clip.fastpath import (
+    fused_momentum_reconstruct_rademacher,
+    fused_perturb_inplace_rademacher,
+    param_hash64,
+    rademacher_counter_reference,
+)
+from muzo_clip.muzo_optimizer import MuZOClipOptimizer
+
+
+def _has_cuda_triton() -> bool:
+    return torch.cuda.is_available() and importlib.util.find_spec("triton") is not None
+
+
+pytestmark = pytest.mark.skipif(not _has_cuda_triton(), reason="fused_rademacher requires CUDA and Triton")
+
+
+def test_fused_perturb_restore_fp32() -> None:
+    weight = torch.zeros((17, 19), device="cuda", dtype=torch.float32)
+    initial = weight.clone()
+    param_hash = param_hash64("layers.0.q_proj.weight", tuple(weight.shape))
+
+    fused_perturb_inplace_rademacher(
+        weight,
+        base_seed=123,
+        param_hash=param_hash,
+        block_index=0,
+        scale=1e-3,
+    )
+    fused_perturb_inplace_rademacher(
+        weight,
+        base_seed=123,
+        param_hash=param_hash,
+        block_index=0,
+        scale=-1e-3,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.max(torch.abs(weight - initial)).item() == 0.0
+
+
+def test_fused_perturb_deterministic() -> None:
+    shape = (32, 32)
+    param_hash = param_hash64("layers.0.q_proj.weight", shape)
+    a = torch.zeros(shape, device="cuda", dtype=torch.float32)
+    b = torch.zeros_like(a)
+    c = torch.zeros_like(a)
+
+    fused_perturb_inplace_rademacher(a, base_seed=999, param_hash=param_hash, block_index=0, scale=1.0)
+    fused_perturb_inplace_rademacher(b, base_seed=999, param_hash=param_hash, block_index=0, scale=1.0)
+    fused_perturb_inplace_rademacher(c, base_seed=999, param_hash=param_hash, block_index=1, scale=1.0)
+    torch.cuda.synchronize()
+
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+@pytest.mark.parametrize("history_len", [1, 4, 8])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_fused_reconstruct_matches_counter_reference(history_len: int, normalize: bool) -> None:
+    shape = (7, 11)
+    param_hash = param_hash64("layers.0.down_proj.weight", shape)
+    seeds = torch.tensor([101 + i * 17 for i in range(history_len)], device="cuda", dtype=torch.int64)
+    coeffs = torch.tensor(
+        [((-1.0) ** i) * (0.25 + 0.1 * i) for i in range(history_len)],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    out = torch.empty(shape, device="cuda", dtype=torch.float32)
+    normalizer = float(sum(0.9**i for i in range(history_len)))
+
+    fused_momentum_reconstruct_rademacher(
+        out,
+        seeds=seeds,
+        coeffs=coeffs,
+        param_hash=param_hash,
+        block_index=3,
+        normalize=normalize,
+        normalizer=normalizer,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.zeros(shape, device="cuda", dtype=torch.float32)
+    for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
+        expected.add_(
+            rademacher_counter_reference(
+                shape,
+                base_seed=int(seed),
+                param_hash=param_hash,
+                block_index=3,
+                device="cuda",
+            ),
+            alpha=float(coeff),
+        )
+    if normalize:
+        expected.div_(torch.tensor(normalizer, device="cuda", dtype=torch.float32))
+
+    if normalize:
+        torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-7)
+    else:
+        assert torch.equal(out, expected)
+
+
+def test_fused_reconstruct_sparse_coeff_zero_case() -> None:
+    shape = (5, 6)
+    param_hash = param_hash64("layers.0.up_proj.weight", shape)
+    out = torch.empty(shape, device="cuda", dtype=torch.float32)
+    fused_momentum_reconstruct_rademacher(
+        out,
+        seeds=torch.tensor([1, 2, 3], device="cuda", dtype=torch.int64),
+        coeffs=torch.zeros(3, device="cuda", dtype=torch.float32),
+        param_hash=param_hash,
+        block_index=0,
+        normalize=True,
+        normalizer=2.71,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+class TinyLinearModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = torch.nn.Linear(8, 8, bias=False)
+        self.down_proj = torch.nn.Linear(8, 8, bias=False)
+
+
+def test_optimizer_fast_path_smoke() -> None:
+    torch.manual_seed(5)
+    model = TinyLinearModel().cuda()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+    opt = MuZOClipOptimizer(
+        model,
+        seed=11,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        block_rows=None,
+    )
+
+    def loss() -> torch.Tensor:
+        return model.q_proj.weight.float().pow(2).mean() + model.down_proj.weight.float().pow(2).mean()
+
+    opt.estimate_projection(loss)
+    stats = opt.step()
+    torch.cuda.synchronize()
+
+    assert stats["skipped"] is False
+    assert stats["updated_param_count"] > 0
+    assert all(torch.isfinite(param).all().item() for param in model.parameters())
+    assert any(not torch.equal(param, before[name]) for name, param in model.named_parameters())

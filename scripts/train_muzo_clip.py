@@ -106,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch_profile_warmup", type=int, default=2)
     parser.add_argument("--torch_profile_active", type=int, default=5)
     parser.add_argument("--torch_profile_repeat", type=int, default=1)
+    parser.add_argument("--gc_every", type=int, default=0)
     parser.add_argument("--no-save_final", dest="save_final", action="store_false", default=True)
     args = parser.parse_args()
     if args.seq_len <= 0 or args.batch_size <= 0:
@@ -116,6 +117,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("min_history must be less than or equal to horizon")
     if args.sparse_update_groups <= 0:
         raise ValueError("sparse_update_groups must be positive")
+    if args.gc_every < 0:
+        raise ValueError("gc_every must be non-negative")
     return args
 
 
@@ -242,6 +245,11 @@ def main() -> None:
         use_cuda_events=True,
         use_nvtx=args.profile_nvtx,
     )
+    if args.profile_phases and torch.cuda.is_available():
+        logging.warning(
+            "--profile_phases uses CUDA event timing with synchronization at phase boundaries; "
+            "tokens_per_second in this mode is diagnostic, not normal training throughput."
+        )
     optimizer = MuZOClipOptimizer(
         model,
         lr=args.lr,
@@ -301,13 +309,13 @@ def main() -> None:
                 except StopIteration:
                     break
             step += 1
+            supervised_tokens = int((batch["labels"] != -100).sum().item())
+            if supervised_tokens <= 0:
+                continue
             with phase_profiler.phase("batch_to_gpu"):
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
-            supervised_tokens = int((labels != -100).sum().item())
-            if supervised_tokens <= 0:
-                continue
 
             def loss_closure() -> torch.Tensor:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
@@ -415,7 +423,8 @@ def main() -> None:
             if torch_prof is not None:
                 torch_prof.step()
             del input_ids, attention_mask, labels
-            gc.collect()
+            if args.gc_every > 0 and step % args.gc_every == 0:
+                gc.collect()
 
     if args.save_final:
         final_dir = output_dir / "final"

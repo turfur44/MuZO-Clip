@@ -18,7 +18,13 @@ from typing import Callable, Iterable
 import torch
 
 from .block_config import BlockRows, resolve_block_rows
-from .fastpath import FastPathBackend, require_supported_backend
+from .fastpath import (
+    FastPathBackend,
+    fused_momentum_reconstruct_rademacher,
+    fused_perturb_inplace_rademacher,
+    param_hash64,
+    require_supported_backend,
+)
 from .newton_schulz import zeropower_via_newtonschulz5
 from .parameter_filter import (
     DEFAULT_FROZEN_SUBSTRINGS,
@@ -366,27 +372,43 @@ class MuZOClipOptimizer:
             block_rows = resolve_block_rows(param.data, self.block_rows)
             for block_index, _, block in iter_param_blocks(param.data, block_rows):
                 with self._phase("muzo_reconstruct"):
-                    M = torch.zeros(block.shape, device=block.device, dtype=torch.float32)
+                    M = torch.empty(block.shape, device=block.device, dtype=torch.float32)
                     coeff_sum = 0.0
+                    history_seeds: list[int] = []
+                    history_coeffs: list[float] = []
                     for age, item in enumerate(reversed(self.history)):
                         if item.active_param_names is not None and selected.name not in item.active_param_names:
                             continue
                         coeff = self.beta_momentum**age
-                        noise = make_zo_noise_like(
-                            block,
-                            item.seed,
-                            selected.name,
-                            block_index=block_index,
-                            distribution=self.distribution,
-                        ).float()
-                        M.add_(noise, alpha=coeff * item.p)
+                        history_seeds.append(int(item.seed))
+                        history_coeffs.append(float(coeff * item.p))
                         coeff_sum += coeff
-
-                if self.normalize_momentum and coeff_sum > 0:
-                    M.div_(coeff_sum)
-                if coeff_sum <= 0:
-                    del M
-                    continue
+                    if coeff_sum <= 0:
+                        del M
+                        continue
+                    if self.fast_path_backend == "fused_rademacher":
+                        fused_momentum_reconstruct_rademacher(
+                            M,
+                            seeds=torch.tensor(history_seeds, device=block.device, dtype=torch.int64),
+                            coeffs=torch.tensor(history_coeffs, device=block.device, dtype=torch.float32),
+                            param_hash=param_hash64(selected.name, tuple(block.shape)),
+                            block_index=block_index,
+                            normalize=self.normalize_momentum,
+                            normalizer=coeff_sum,
+                        )
+                    else:
+                        M.zero_()
+                        for item_seed, item_coeff in zip(history_seeds, history_coeffs):
+                            noise = make_zo_noise_like(
+                                block,
+                                item_seed,
+                                selected.name,
+                                block_index=block_index,
+                                distribution=self.distribution,
+                            ).float()
+                            M.add_(noise, alpha=item_coeff)
+                        if self.normalize_momentum:
+                            M.div_(coeff_sum)
 
                 with self._phase("newton_schulz"):
                     U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
@@ -503,14 +525,23 @@ class MuZOClipOptimizer:
         for selected in selected_items:
             block_rows = resolve_block_rows(selected.param.data, self.block_rows)
             for block_index, _, block in iter_param_blocks(selected.param.data, block_rows):
-                noise = make_zo_noise_like(
-                    block,
-                    seed,
-                    selected.name,
-                    block_index=block_index,
-                    distribution=self.distribution,
-                )
-                block.add_(noise, alpha=scale)
+                if self.fast_path_backend == "fused_rademacher":
+                    fused_perturb_inplace_rademacher(
+                        block,
+                        base_seed=seed,
+                        param_hash=param_hash64(selected.name, tuple(block.shape)),
+                        block_index=block_index,
+                        scale=scale,
+                    )
+                else:
+                    noise = make_zo_noise_like(
+                        block,
+                        seed,
+                        selected.name,
+                        block_index=block_index,
+                        distribution=self.distribution,
+                    )
+                    block.add_(noise, alpha=scale)
 
     @contextlib.contextmanager
     def _phase(self, name: str):
