@@ -1,22 +1,42 @@
 # MuZO-Clip
 
-MuZO-Clip is an experimental optimizer variant:
+MuZO-Clip is an experimental research prototype for zeroth-order full-parameter
+fine-tuning.
+
+It combines three ideas:
+
+- AdaMeZO-style SPSA projections with deterministic PRNG reconstruction
+- Muon-style Newton-Schulz matrix updates for hidden 2D transformer weights
+- optional QK-Clip stabilization from clean pre-softmax attention logits
+
+This is not a drop-in "Muon optimizer for AdaMeZO". The optimizer keeps the
+memory-free PRNG reconstruction idea from AdaMeZO, but intentionally replaces
+Adam-style second-moment preconditioning with a Muon-style matrix update.
+
+## Status
+
+This repository contains the standalone `muzo_clip` Python package only. It is
+intended to be imported by training scripts, experiments, or downstream forks.
+
+Large-model training scripts, dashboards, datasets, and checkpoints are not
+included in this public package.
+
+This code is experimental. It is not proven to be stable or better than MeZO,
+AdaMeZO, Muon, LoRA, or first-order fine-tuning. Test on small models first.
+
+## Core Update
+
+For each selected 2D weight matrix `W`, MuZO-Clip estimates SPSA scalar
+projections:
 
 ```text
-AdaMeZO PRNG-based memory-free zeroth-order gradient reconstruction
-+ Muon Newton-Schulz matrix update
-+ optional QK-Clip stabilization
+p_t = (L(w_t + eps * z_t) - L(w_t - eps * z_t)) / (2 * eps)
+G_t^W = p_t * Z_t^W
 ```
 
-It intentionally replaces AdaMeZO's Adam-style second-moment update with a
-Muon-style matrix update for selected hidden 2D weights.
-
-This is not "Muon optimizer added to AdaMeZO".  It keeps the AdaMeZO idea of
-reconstructing zeroth-order directions from small history, but changes the
-update geometry:
+It then reconstructs recent directions from seed history:
 
 ```text
-G_t^W = p_t * Z_t^W
 M_t^W = sum_i beta^i * p_{t-i} * Z_{t-i}^W
 U_t^W = NewtonSchulz(M_t^W)
 U_t^W = U_t^W * sqrt(max(n, m)) * muon_scale
@@ -24,47 +44,49 @@ W <- W - lr * U_t^W
 W <- W * (1 - lr * weight_decay)
 ```
 
-This is experimental and should be tested first on small models.
+The momentum matrix `M_t^W` is temporary and accumulated in fp32. It is not
+stored persistently.
 
-## Safety Constraints
+## Memory Constraints
 
 MuZO-Clip does not:
 
-- store full model-size momentum buffers
-- store full model-size variance buffers
+- store model-size momentum buffers
+- store model-size variance buffers
 - store perturbation tensors
 - call `loss.backward()`
 - rely on `param.grad`
-- use `torch.optim.Optimizer` in the first-order optimizer path
-- apply Muon updates to embeddings, `lm_head`, norms, or biases by default
+- use `torch.optim.Optimizer` as a normal first-order optimizer
+- update embeddings, `lm_head`, norm layers, or biases by default
 
-Persistent optimizer history is small:
+Persistent optimizer state is intentionally small:
 
 - step seeds
-- scalar projections `p_t`
-- scalar loss stats
-- small QK-Clip per-head maxima when QK-Clip capture is enabled
+- scalar projections
+- scalar loss statistics
+- optional small QK-Clip statistics
 
-Temporary per-matrix or per-block buffers are allocated during `step()` in fp32
-and then released by normal Python/PyTorch lifetime.
+Temporary per-matrix or per-block tensors are allowed during update and then
+released by normal Python/PyTorch lifetime.
 
 ## Deterministic PRNG
 
 The critical invariant is:
 
 ```text
-Z used during plus/minus SPSA perturbation == Z reconstructed during update
+noise used during SPSA perturbation == noise reconstructed during update
 ```
 
-`muzo_clip/prng.py` uses param-wise deterministic seeds:
+`muzo_clip.prng.make_zo_noise_like(...)` derives deterministic param-wise random
+directions from:
 
 ```text
 hash64(global_step_seed, param_name, param_shape, block_index)
 ```
 
-This avoids depending on global generator order.  The same
-`make_zo_noise_like(...)` function is used for plus perturbation, minus
-perturbation, restore, and historical momentum reconstruction.
+This avoids depending on global RNG order. The same function is used for plus
+perturbation, minus perturbation, restore, and historical momentum
+reconstruction.
 
 Supported distributions:
 
@@ -73,32 +95,42 @@ Supported distributions:
 
 ## Parameter Selection
 
-Default selected names include:
+By default, MuZO-Clip updates hidden 2D transformer matrices whose names include:
 
 ```text
 q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 ```
 
-Default excluded names include:
+It excludes names containing:
 
 ```text
 embed_tokens, lm_head, norm, bias, layernorm, ln_
 ```
 
-Only 2D parameters matching the selected names and not matching excluded names
-are updated.
+Autograd is not required for selected parameters. The optimizer updates them
+in-place under `torch.no_grad()`.
 
 ## QK-Clip
 
-QK-Clip is optional.  It is only applied from pre-softmax attention logits.
-Post-softmax attention weights are never used.
+QK-Clip is optional and conservative.
 
-The implementation captures the input to `torch.nn.functional.softmax` or
-`torch.softmax` while a module with `q_proj` and `k_proj` is executing.  This is
-intended for HuggingFace eager attention.
+It must use pre-softmax attention logits:
 
-For speed, do not run eager attention on every training step.  Use the fast
-training kernel normally, then periodically run one clean QK probe:
+```text
+Q K^T / sqrt(d_head)
+```
+
+Post-softmax attention probabilities are not valid for QK-Clip and are not used
+as a substitute.
+
+The current implementation captures Python-level `torch.nn.functional.softmax`
+or `torch.softmax` calls while modules containing `q_proj` and `k_proj` execute.
+This is a best-effort path for HuggingFace eager attention. If SDPA,
+FlashAttention, Triton, or another fused kernel hides the logits, QK-Clip is
+disabled and reports the reason instead of faking a metric.
+
+For faster experiments, run the main training loop with SDPA/FlashAttention and
+periodically do a clean eager probe:
 
 ```python
 proj_stats = optimizer.estimate_projection(loss_closure)
@@ -111,66 +143,124 @@ if step % qk_check_every == 0:
     )
 ```
 
-This keeps SDPA/FlashAttention on the main path and uses best-effort eager mode
-only for the clean probe forward.  If the model cannot expose pre-softmax logits
-even under eager mode, QK-Clip returns disabled instead of faking the metric.
-
-If logits are not captured, QK-Clip reports:
+Good signs:
 
 ```text
-QK-Clip disabled because pre-softmax logits are unavailable. Use attn_implementation='eager'.
+qk_smax_max > 0
+disabled_reason is None
+fallback_used is False, when exact per-head slicing is available
 ```
 
-If per-head slicing is clear, rows of `q_proj.weight` and `k_proj.weight` are
-scaled per head.  If exact head slicing is unclear, the conservative whole-matrix
-fallback scales both matrices and reports `fallback_used=True`.
+If the model architecture does not expose enough metadata for exact head
+slicing, MuZO-Clip may use a whole-matrix fallback and report
+`fallback_used=True`.
 
-## Example
-
-```bash
-python scripts/train_muzo_clip.py \
-  --model_name Qwen/Qwen3-0.6B \
-  --data_path data/train.jsonl \
-  --seq_len 512 \
-  --steps 1000 \
-  --lr 1e-5 \
-  --zo_eps 1e-3 \
-  --horizon 8 \
-  --qk_clip_tau 100 \
-  --qk_check_every 50 \
-  --attn_implementation sdpa
-```
-
-For a very small smoke test, use a tiny model first:
-
-```bash
-python scripts/train_muzo_clip.py \
-  --model_name sshleifer/tiny-gpt2 \
-  --data_path data/smoke.txt \
-  --seq_len 64 \
-  --steps 10 \
-  --lr 1e-5 \
-  --zo_eps 1e-3 \
-  --horizon 2 \
-  --disable_qk_clip
-```
-
-## Tests
+## Installation
 
 From the repository root:
 
 ```bash
-python -m pytest muzo_clip/tests -q
+pip install -e .
 ```
 
-The tests cover:
+Runtime dependency is currently only PyTorch:
 
-- deterministic PRNG reconstruction
-- no `param.grad` or large persistent tensor state
-- Newton-Schulz shape and zero/bf16 safety
-- one projection and one update on a tiny model without backward
+```bash
+pip install torch
+```
 
-## Notes
+Your training script will usually also need `transformers`, `accelerate`, and
+dataset tooling.
 
-The AdaMeZO source under `MeZO/` is used only as a reference.  MuZO-Clip lives in
-this folder and the standalone script lives at `scripts/train_muzo_clip.py`.
+## Minimal Usage
+
+```python
+from muzo_clip import MuZOClipOptimizer
+
+optimizer = MuZOClipOptimizer(
+    model,
+    lr=1e-5,
+    zo_eps=1e-3,
+    horizon=8,
+    min_history=4,
+    beta_momentum=0.9,
+    weight_decay=0.01,
+    muon_scale=0.2,
+    update_ratio_clip=0.01,
+    enable_qk_clip=True,
+)
+
+def loss_closure():
+    with torch.no_grad():
+        outputs = model(**batch)
+        return outputs.loss
+
+proj_stats = optimizer.estimate_projection(loss_closure)
+step_stats = optimizer.step()
+
+if global_step % 50 == 0:
+    qk_stats = optimizer.probe_and_apply_qk_clip(loss_closure, force_eager=True)
+```
+
+Training scripts must provide the loss closure, batching, checkpointing, logging,
+and optional assistant-only label masking.
+
+## Important Defaults
+
+```text
+lr = 1e-5
+zo_eps = 1e-3
+horizon = 8
+min_history = 4
+beta_momentum = 0.9
+weight_decay = 0.01
+muon_scale = 0.2
+p_clip_value = 3.0
+update_ratio_clip = 0.01
+rollback = False
+restore_exact = False
+distribution = normal
+```
+
+`rollback=False` avoids copying selected parameters to CPU every step. That CPU
+snapshot path is too expensive for large models.
+
+When using fp16/bf16 parameters with `restore_exact=False`, perturb/restore is
+not bit-exact because low precision arithmetic rounds the in-place updates. For
+initial correctness checks, fp32 weights are easier to reason about.
+
+## What To Watch
+
+Useful training logs:
+
+```text
+loss_plus
+loss_minus
+p_raw
+p_used
+update_ratio_max
+update_rms_mean
+qk_smax_max
+qk_clip_count
+fallback_used
+disabled_reason
+gpu_memory_allocated
+```
+
+Sanity checks:
+
+- `p_used` should not be glued to `+3` or `-3` forever
+- `update_ratio_max` should respect `update_ratio_clip`
+- QK-Clip should report a real `qk_smax_max` when enabled and logits are visible
+- `disabled_reason` must be treated as QK-Clip not actually running
+
+## Non-Goals
+
+This repository does not claim:
+
+- that MuZO-Clip is better than MeZO or AdaMeZO
+- that QK-Clip works through fused attention kernels
+- that this is production-ready
+- that this is a complete trainer
+
+The goal is to keep the optimizer logic small, inspectable, and reproducible.
