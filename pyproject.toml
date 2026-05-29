@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muzo-clip"
+version = "0.1.0"
+description = "Experimental Muon-style zeroth-order optimizer with optional QK-Clip stabilization"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[tool.setuptools.packages.find]
+include = ["muzo_clip*"]
