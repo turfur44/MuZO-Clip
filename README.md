@@ -129,6 +129,9 @@ This is a best-effort path for HuggingFace eager attention. If SDPA,
 FlashAttention, Triton, or another fused kernel hides the logits, QK-Clip is
 disabled and reports the reason instead of faking a metric.
 
+For fused-attention limitations and planned QK-Clip backends, see
+[QK_CLIP_LIMITATIONS_AND_FUTURE_WORK.md](docs/QK_CLIP_LIMITATIONS_AND_FUTURE_WORK.md).
+
 For faster experiments, run the main training loop with SDPA/FlashAttention and
 periodically do a clean eager probe:
 
