@@ -22,6 +22,7 @@ from .fastpath import (
     FastPathBackend,
     fused_momentum_reconstruct_rademacher,
     fused_momentum_reconstruct_rademacher_batched,
+    fused_momentum_reconstruct_rademacher_grouped,
     fused_perturb_inplace_rademacher,
     param_hash64,
     require_supported_backend,
@@ -41,7 +42,7 @@ from .sparse_schedule import SparseUpdateMode, names_hash, select_active_paramet
 logger = logging.getLogger(__name__)
 
 UpdateFastPath = Literal["torch", "gpu_stats"]
-MatrixUpdateMode = Literal["block_loop", "batched_blocks"]
+MatrixUpdateMode = Literal["block_loop", "batched_blocks", "per_param_batched", "grouped_batched"]
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,19 @@ class StepStats:
     active_param_names_hash: str
     skipped: bool
     skip_reason: str | None
+    grouped_batched_group_count: int = 0
+    grouped_batched_block_count: int = 0
+    grouped_batched_shape_count: int = 0
+    grouped_batched_avg_batch_size: float = 0.0
+    grouped_batched_max_batch_size: int = 0
+
+
+@dataclass(frozen=True)
+class BlockRef:
+    selected: SelectedParameter
+    block: torch.Tensor
+    block_index: int
+    shape: tuple[int, int]
 
 
 def _as_float(value: torch.Tensor | float | object) -> float:
@@ -129,6 +143,7 @@ class MuZOClipOptimizer:
         sparse_update_mode: SparseUpdateMode = "off",
         sparse_update_groups: int = 1,
         full_block_max_elements: int = 8_388_608,
+        grouped_batched_max_blocks: int = 64,
     ):
         if horizon <= 0:
             raise ValueError("horizon must be positive")
@@ -148,12 +163,17 @@ class MuZOClipOptimizer:
             raise ValueError("sparse_update_groups must be positive")
         if update_fast_path not in ("torch", "gpu_stats"):
             raise ValueError(f"Unsupported update_fast_path: {update_fast_path}")
-        if matrix_update_mode not in ("block_loop", "batched_blocks"):
+        if matrix_update_mode not in ("block_loop", "batched_blocks", "per_param_batched", "grouped_batched"):
             raise ValueError(f"Unsupported matrix_update_mode: {matrix_update_mode}")
-        if matrix_update_mode == "batched_blocks" and fast_path_backend != "fused_rademacher":
-            raise RuntimeError("matrix_update_mode='batched_blocks' requires fast_path_backend='fused_rademacher'")
+        if matrix_update_mode in ("batched_blocks", "per_param_batched", "grouped_batched") and fast_path_backend != "fused_rademacher":
+            raise RuntimeError(
+                "matrix_update_mode='batched_blocks', 'per_param_batched', or 'grouped_batched' "
+                "requires fast_path_backend='fused_rademacher'"
+            )
         if full_block_max_elements <= 0:
             raise ValueError("full_block_max_elements must be positive")
+        if grouped_batched_max_blocks <= 0:
+            raise ValueError("grouped_batched_max_blocks must be positive")
         require_supported_backend(fast_path_backend, distribution)
 
         self.model = model
@@ -172,6 +192,7 @@ class MuZOClipOptimizer:
         self.update_fast_path = update_fast_path
         self.matrix_update_mode = matrix_update_mode
         self.full_block_max_elements = int(full_block_max_elements)
+        self.grouped_batched_max_blocks = int(grouped_batched_max_blocks)
         self.rollback = bool(rollback)
         self.restore_exact = bool(restore_exact)
         self.min_history = int(min_history)
@@ -418,6 +439,44 @@ class MuZOClipOptimizer:
                         coeffs = [value / coeff_sum for value in coeffs]
                 fused_shared_coeffs = torch.tensor(coeffs, device=active_params[0].param.device, dtype=torch.float32)
 
+        grouped_stats = {
+            "grouped_batched_group_count": 0,
+            "grouped_batched_block_count": 0,
+            "grouped_batched_shape_count": 0,
+            "grouped_batched_avg_batch_size": 0.0,
+            "grouped_batched_max_batch_size": 0,
+        }
+        if self.matrix_update_mode == "grouped_batched":
+            assert fused_history_seeds is not None
+            updated_param_count, grouped_stats = self._update_grouped_batched_blocks(
+                active_params,
+                fused_history_seeds,
+                fused_shared_coeffs,
+                lr,
+                update_rms_tensors,
+                update_ratio_tensors,
+            )
+            self._has_pending_update = False
+            self._last_step_updated = updated_param_count > 0
+            if update_rms_tensors:
+                mean_update_rms_tensor = torch.cat([value.reshape(-1) for value in update_rms_tensors]).mean()
+                update_ratio_max_tensor = torch.cat([value.reshape(-1) for value in update_ratio_tensors]).max()
+                mean_update_rms = float(mean_update_rms_tensor.item())
+                update_ratio_max = float(update_ratio_max_tensor.item())
+            else:
+                mean_update_rms = 0.0
+            return StepStats(
+                lr=lr,
+                update_rms_mean=mean_update_rms,
+                update_ratio_max=update_ratio_max,
+                updated_param_count=updated_param_count,
+                active_param_count=len(active_names_set),
+                active_param_names_hash=names_hash(active_names),
+                skipped=False,
+                skip_reason=None,
+                **grouped_stats,
+            ).__dict__
+
         for selected in active_params:
             param = selected.param
             fused_seeds: torch.Tensor | None = None
@@ -447,7 +506,7 @@ class MuZOClipOptimizer:
                 self.block_rows,
                 full_block_max_elements=self.full_block_max_elements,
             )
-            if self.matrix_update_mode == "batched_blocks":
+            if self.matrix_update_mode in ("batched_blocks", "per_param_batched"):
                 assert fused_seeds is not None and fused_coeffs is not None
                 updated_param_count += self._update_selected_batched_blocks(
                     selected,
@@ -494,6 +553,7 @@ class MuZOClipOptimizer:
             active_param_names_hash=names_hash(active_names),
             skipped=False,
             skip_reason=None,
+            **grouped_stats,
         ).__dict__
 
     def _update_single_block(
@@ -624,6 +684,150 @@ class MuZOClipOptimizer:
 
         return updated_blocks
 
+    def _fused_coeffs_for_selected(
+        self,
+        selected: SelectedParameter,
+        device: torch.device,
+        shared_coeffs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if shared_coeffs is not None:
+            return shared_coeffs
+        coeffs: list[float] = []
+        coeff_sum = 0.0
+        for age, item in enumerate(reversed(self.history)):
+            coeff = self.beta_momentum**age
+            if item.active_param_names is None or selected.name in item.active_param_names:
+                coeffs.append(float(coeff * item.p))
+                coeff_sum += coeff
+            else:
+                coeffs.append(0.0)
+        if coeff_sum <= 0:
+            return None
+        if self.normalize_momentum:
+            coeffs = [value / coeff_sum for value in coeffs]
+        return torch.tensor(coeffs, device=device, dtype=torch.float32)
+
+    def _update_grouped_batched_blocks(
+        self,
+        active_params: list[SelectedParameter],
+        fused_seeds: torch.Tensor,
+        shared_coeffs: torch.Tensor | None,
+        lr: float,
+        update_rms_tensors: list[torch.Tensor],
+        update_ratio_tensors: list[torch.Tensor],
+    ) -> tuple[int, dict[str, int | float]]:
+        groups: dict[tuple[int, int], list[BlockRef]] = {}
+        tail_refs: list[BlockRef] = []
+        updated_blocks = 0
+
+        for selected in active_params:
+            param = selected.param.data
+            rows = int(param.shape[0])
+            cols = int(param.shape[1])
+            block_rows = resolve_block_rows(
+                param,
+                self.block_rows,
+                full_block_max_elements=self.full_block_max_elements,
+            )
+            full_rows = rows if block_rows is None else int(block_rows)
+            full_blocks = rows // full_rows
+            tail_rows = rows - full_blocks * full_rows
+
+            for block_index in range(full_blocks):
+                row_start = block_index * full_rows
+                block = param[row_start : row_start + full_rows]
+                ref = BlockRef(selected=selected, block=block, block_index=block_index, shape=(full_rows, cols))
+                groups.setdefault(ref.shape, []).append(ref)
+
+            if tail_rows > 0:
+                tail_start = full_blocks * full_rows
+                tail_refs.append(
+                    BlockRef(
+                        selected=selected,
+                        block=param[tail_start:],
+                        block_index=full_blocks,
+                        shape=(tail_rows, cols),
+                    )
+                )
+
+        grouped_group_count = 0
+        grouped_block_count = 0
+        grouped_max_batch_size = 0
+
+        for shape, refs in groups.items():
+            block_rows, cols = shape
+            for start in range(0, len(refs), self.grouped_batched_max_blocks):
+                chunk = refs[start : start + self.grouped_batched_max_blocks]
+                batch_size = len(chunk)
+                grouped_group_count += 1
+                grouped_block_count += batch_size
+                grouped_max_batch_size = max(grouped_max_batch_size, batch_size)
+
+                with self._phase("muzo_reconstruct"):
+                    M_batch = torch.empty((batch_size, block_rows, cols), device=chunk[0].block.device, dtype=torch.float32)
+                    param_hashes = torch.tensor(
+                        [self._param_hashes[ref.selected.name] for ref in chunk],
+                        device=M_batch.device,
+                        dtype=torch.int64,
+                    )
+                    block_indices = torch.tensor(
+                        [ref.block_index for ref in chunk],
+                        device=M_batch.device,
+                        dtype=torch.int64,
+                    )
+                    if shared_coeffs is not None:
+                        coeffs = shared_coeffs
+                    else:
+                        coeff_rows = [
+                            self._fused_coeffs_for_selected(ref.selected, M_batch.device, None) for ref in chunk
+                        ]
+                        if any(row is None for row in coeff_rows):
+                            raise RuntimeError("grouped_batched received a block with no active history coefficients")
+                        coeffs = torch.stack([row for row in coeff_rows if row is not None])
+                    fused_momentum_reconstruct_rademacher_grouped(
+                        M_batch,
+                        seeds=fused_seeds,
+                        coeffs=coeffs,
+                        param_hashes=param_hashes,
+                        block_indices=block_indices,
+                    )
+
+                with self._phase("newton_schulz"):
+                    U_batch = batched_zeropower_via_newtonschulz5(M_batch, steps=self.ns_steps)
+
+                with self._phase("apply_update"):
+                    update_rms_batch, ratio_batch = self._apply_update_grouped_refs(chunk, U_batch, lr)
+                    update_rms_tensors.append(update_rms_batch)
+                    update_ratio_tensors.append(ratio_batch)
+                updated_blocks += batch_size
+                del M_batch, U_batch
+
+        for ref in tail_refs:
+            coeffs = self._fused_coeffs_for_selected(ref.selected, ref.block.device, shared_coeffs)
+            if coeffs is None:
+                continue
+            self._update_single_block(
+                ref.selected,
+                ref.block,
+                ref.block_index,
+                fused_seeds,
+                coeffs,
+                lr,
+                [],
+                update_rms_tensors,
+                update_ratio_tensors,
+            )
+            updated_blocks += 1
+
+        avg_batch_size = grouped_block_count / grouped_group_count if grouped_group_count else 0.0
+        return updated_blocks, {
+            "grouped_batched_group_count": grouped_group_count,
+            "grouped_batched_block_count": grouped_block_count,
+            "grouped_batched_shape_count": len(groups),
+            "grouped_batched_avg_batch_size": float(avg_batch_size),
+            "grouped_batched_max_batch_size": grouped_max_batch_size,
+        }
+
     def _apply_update_gpu_stats(
         self,
         block: torch.Tensor,
@@ -644,6 +848,35 @@ class MuZOClipOptimizer:
         if self.weight_decay:
             block.mul_(1.0 - lr * self.weight_decay)
         return scaled_update_rms.detach(), scaled_ratio.detach()
+
+    def _apply_update_grouped_refs(
+        self,
+        refs: list[BlockRef],
+        U_batch: torch.Tensor,
+        lr: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        update_rms_values: list[torch.Tensor] = []
+        ratio_values: list[torch.Tensor] = []
+        scale = math.sqrt(max(int(U_batch.shape[1]), int(U_batch.shape[2]))) * self.muon_scale
+        U_batch.mul_(scale)
+        for batch_index, ref in enumerate(refs):
+            U = U_batch[batch_index]
+            block = ref.block
+            update_rms = _rms(U) * lr
+            weight_rms = _rms(block)
+            ratio = update_rms / (weight_rms + 1e-12)
+            clip = ratio.new_tensor(self.update_ratio_clip)
+            should_clip = ratio > clip
+            clip_scale = torch.where(should_clip, clip / ratio.clamp_min(1e-12), torch.ones_like(ratio))
+            scaled_update_rms = torch.where(should_clip, clip * (weight_rms + 1e-12), update_rms)
+            scaled_ratio = torch.where(should_clip, clip, ratio)
+            U.mul_(clip_scale)
+            block.add_(U.to(dtype=block.dtype), alpha=-lr)
+            if self.weight_decay:
+                block.mul_(1.0 - lr * self.weight_decay)
+            update_rms_values.append(scaled_update_rms.detach().reshape(1))
+            ratio_values.append(scaled_ratio.detach().reshape(1))
+        return torch.cat(update_rms_values), torch.cat(ratio_values)
 
     def _apply_update_batched_gpu_stats(
         self,

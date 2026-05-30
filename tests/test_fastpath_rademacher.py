@@ -8,6 +8,7 @@ import torch
 from muzo_clip.fastpath import (
     fused_momentum_reconstruct_rademacher,
     fused_momentum_reconstruct_rademacher_batched,
+    fused_momentum_reconstruct_rademacher_grouped,
     fused_perturb_inplace_rademacher,
     param_hash64,
     rademacher_counter_reference,
@@ -215,6 +216,91 @@ def test_fused_batched_reconstruct_matches_counter_reference(history_len: int) -
     torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-6)
 
 
+@pytest.mark.parametrize("history_len", [1, 4, 8])
+def test_fused_grouped_reconstruct_matches_counter_reference(history_len: int) -> None:
+    shape = (4, 5, 7)
+    param_shapes = [(10, 7), (15, 7), (10, 7), (20, 7)]
+    names = [
+        "layers.0.q_proj.weight",
+        "layers.1.q_proj.weight",
+        "layers.0.down_proj.weight",
+        "layers.1.down_proj.weight",
+    ]
+    param_hashes_cpu = [param_hash64(name, param_shape) for name, param_shape in zip(names, param_shapes)]
+    block_indices_cpu = [0, 2, 1, 3]
+    seeds = torch.tensor([701 + i * 23 for i in range(history_len)], device="cuda", dtype=torch.int64)
+    coeffs = torch.tensor(
+        [((-1.0) ** i) * (0.15 + 0.07 * i) for i in range(history_len)],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    out = torch.empty(shape, device="cuda", dtype=torch.float32)
+    fused_momentum_reconstruct_rademacher_grouped(
+        out,
+        seeds=seeds,
+        coeffs=coeffs,
+        param_hashes=torch.tensor(param_hashes_cpu, device="cuda", dtype=torch.int64),
+        block_indices=torch.tensor(block_indices_cpu, device="cuda", dtype=torch.int64),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.empty_like(out)
+    for batch_index, (param_hash, block_index) in enumerate(zip(param_hashes_cpu, block_indices_cpu)):
+        ref = torch.zeros(shape[1:], device="cuda", dtype=torch.float32)
+        for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
+            ref.add_(
+                rademacher_counter_reference(
+                    shape[1:],
+                    base_seed=int(seed),
+                    param_hash=param_hash,
+                    block_index=block_index,
+                    device="cuda",
+                ),
+                alpha=float(coeff),
+            )
+        expected[batch_index].copy_(ref)
+
+    torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-6)
+
+
+def test_fused_grouped_reconstruct_sparse_coeff_matrix_zero_behavior() -> None:
+    shape = (2, 3, 4)
+    param_hashes_cpu = [
+        param_hash64("layers.0.q_proj.weight", (6, 4)),
+        param_hash64("layers.1.q_proj.weight", (6, 4)),
+    ]
+    seeds = torch.tensor([1, 2, 3, 4], device="cuda", dtype=torch.int64)
+    coeffs = torch.tensor(
+        [[0.25, 0.0, -0.5, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    out = torch.empty(shape, device="cuda", dtype=torch.float32)
+    fused_momentum_reconstruct_rademacher_grouped(
+        out,
+        seeds=seeds,
+        coeffs=coeffs,
+        param_hashes=torch.tensor(param_hashes_cpu, device="cuda", dtype=torch.int64),
+        block_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int64),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    expected0 = torch.zeros(shape[1:], device="cuda", dtype=torch.float32)
+    for seed, coeff in zip(seeds.cpu().tolist(), coeffs[0].cpu().tolist()):
+        expected0.add_(
+            rademacher_counter_reference(
+                shape[1:],
+                base_seed=int(seed),
+                param_hash=param_hashes_cpu[0],
+                block_index=0,
+                device="cuda",
+            ),
+            alpha=float(coeff),
+        )
+    torch.testing.assert_close(out[0], expected0, rtol=0.0, atol=1e-6)
+
+
 class TinyLinearModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -364,6 +450,60 @@ def test_optimizer_batched_blocks_tail_smoke() -> None:
     assert stats["updated_param_count"] == 6
     assert torch.isfinite(torch.tensor(float(stats["update_rms_mean"]))).item()
     assert torch.isfinite(torch.tensor(float(stats["update_ratio_max"]))).item()
+
+
+def test_optimizer_grouped_batched_matches_block_loop() -> None:
+    torch.manual_seed(18)
+    model_a = TinyLinearModel().cuda()
+    model_b = TinyLinearModel().cuda()
+    model_b.load_state_dict(model_a.state_dict())
+    for param in model_a.parameters():
+        param.requires_grad_(False)
+    for param in model_b.parameters():
+        param.requires_grad_(False)
+
+    opt_a = MuZOClipOptimizer(
+        model_a,
+        seed=23,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        update_fast_path="gpu_stats",
+        block_rows=4,
+    )
+    opt_b = MuZOClipOptimizer(
+        model_b,
+        seed=23,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        matrix_update_mode="grouped_batched",
+        block_rows=4,
+        grouped_batched_max_blocks=16,
+    )
+
+    def loss_a() -> torch.Tensor:
+        return model_a.q_proj.weight.float().pow(2).mean() + model_a.down_proj.weight.float().pow(2).mean()
+
+    def loss_b() -> torch.Tensor:
+        return model_b.q_proj.weight.float().pow(2).mean() + model_b.down_proj.weight.float().pow(2).mean()
+
+    opt_a.estimate_projection(loss_a)
+    opt_b.estimate_projection(loss_b)
+    stats_a = opt_a.step()
+    stats_b = opt_b.step()
+    torch.cuda.synchronize()
+
+    assert stats_a["skipped"] is False
+    assert stats_b["skipped"] is False
+    assert stats_a["updated_param_count"] == stats_b["updated_param_count"]
+    assert stats_b["grouped_batched_shape_count"] == 1
+    assert stats_b["grouped_batched_block_count"] == 4
+    assert stats_b["grouped_batched_max_batch_size"] == 4
+    assert torch.allclose(model_a.q_proj.weight, model_b.q_proj.weight, atol=1e-6, rtol=0.0)
+    assert torch.allclose(model_a.down_proj.weight, model_b.down_proj.weight, atol=1e-6, rtol=0.0)
 
 
 def test_optimizer_fast_path_rejects_cpu_selected_param() -> None:
