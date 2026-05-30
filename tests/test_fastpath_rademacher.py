@@ -7,6 +7,7 @@ import torch
 
 from muzo_clip.fastpath import (
     fused_momentum_reconstruct_rademacher,
+    fused_momentum_reconstruct_rademacher_batched,
     fused_perturb_inplace_rademacher,
     param_hash64,
     rademacher_counter_reference,
@@ -175,11 +176,57 @@ def test_fused_reconstruct_sparse_coeff_zero_case() -> None:
     assert torch.equal(out, torch.zeros_like(out))
 
 
+@pytest.mark.parametrize("history_len", [1, 4, 8])
+def test_fused_batched_reconstruct_matches_counter_reference(history_len: int) -> None:
+    shape = (3, 5, 7)
+    param_hash = param_hash64("layers.0.gate_proj.weight", (15, 7))
+    seeds = torch.tensor([501 + i * 19 for i in range(history_len)], device="cuda", dtype=torch.int64)
+    coeffs = torch.tensor(
+        [((-1.0) ** i) * (0.2 + 0.05 * i) for i in range(history_len)],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    out = torch.empty(shape, device="cuda", dtype=torch.float32)
+    fused_momentum_reconstruct_rademacher_batched(
+        out,
+        seeds=seeds,
+        coeffs=coeffs,
+        param_hash=param_hash,
+        block_start_index=2,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.empty_like(out)
+    for batch_index in range(shape[0]):
+        ref = torch.zeros(shape[1:], device="cuda", dtype=torch.float32)
+        for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
+            ref.add_(
+                rademacher_counter_reference(
+                    shape[1:],
+                    base_seed=int(seed),
+                    param_hash=param_hash,
+                    block_index=2 + batch_index,
+                    device="cuda",
+                ),
+                alpha=float(coeff),
+            )
+        expected[batch_index].copy_(ref)
+
+    torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-6)
+
+
 class TinyLinearModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.q_proj = torch.nn.Linear(8, 8, bias=False)
         self.down_proj = torch.nn.Linear(8, 8, bias=False)
+
+
+class TailLinearModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = torch.nn.Linear(8, 10, bias=False)
+        self.down_proj = torch.nn.Linear(8, 10, bias=False)
 
 
 def test_optimizer_fast_path_smoke() -> None:
@@ -236,6 +283,85 @@ def test_optimizer_fast_path_with_gpu_stats_update_smoke() -> None:
 
     assert stats["skipped"] is False
     assert stats["updated_param_count"] > 0
+    assert torch.isfinite(torch.tensor(float(stats["update_rms_mean"]))).item()
+    assert torch.isfinite(torch.tensor(float(stats["update_ratio_max"]))).item()
+
+
+def test_optimizer_batched_blocks_matches_block_loop() -> None:
+    torch.manual_seed(8)
+    model_a = TinyLinearModel().cuda()
+    model_b = TinyLinearModel().cuda()
+    model_b.load_state_dict(model_a.state_dict())
+    for param in model_a.parameters():
+        param.requires_grad_(False)
+    for param in model_b.parameters():
+        param.requires_grad_(False)
+
+    opt_a = MuZOClipOptimizer(
+        model_a,
+        seed=13,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        update_fast_path="gpu_stats",
+        block_rows=4,
+    )
+    opt_b = MuZOClipOptimizer(
+        model_b,
+        seed=13,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        matrix_update_mode="batched_blocks",
+        block_rows=4,
+    )
+
+    def loss_a() -> torch.Tensor:
+        return model_a.q_proj.weight.float().pow(2).mean() + model_a.down_proj.weight.float().pow(2).mean()
+
+    def loss_b() -> torch.Tensor:
+        return model_b.q_proj.weight.float().pow(2).mean() + model_b.down_proj.weight.float().pow(2).mean()
+
+    opt_a.estimate_projection(loss_a)
+    opt_b.estimate_projection(loss_b)
+    stats_a = opt_a.step()
+    stats_b = opt_b.step()
+    torch.cuda.synchronize()
+
+    assert stats_a["skipped"] is False
+    assert stats_b["skipped"] is False
+    assert stats_a["updated_param_count"] == stats_b["updated_param_count"]
+    assert torch.allclose(model_a.q_proj.weight, model_b.q_proj.weight, atol=1e-6, rtol=0.0)
+    assert torch.allclose(model_a.down_proj.weight, model_b.down_proj.weight, atol=1e-6, rtol=0.0)
+    assert torch.isfinite(torch.tensor(float(stats_b["update_rms_mean"]))).item()
+    assert torch.isfinite(torch.tensor(float(stats_b["update_ratio_max"]))).item()
+
+
+def test_optimizer_batched_blocks_tail_smoke() -> None:
+    torch.manual_seed(10)
+    model = TailLinearModel().cuda()
+    opt = MuZOClipOptimizer(
+        model,
+        seed=15,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        matrix_update_mode="batched_blocks",
+        block_rows=4,
+    )
+
+    def loss() -> torch.Tensor:
+        return model.q_proj.weight.float().pow(2).mean() + model.down_proj.weight.float().pow(2).mean()
+
+    opt.estimate_projection(loss)
+    stats = opt.step()
+    torch.cuda.synchronize()
+
+    assert stats["skipped"] is False
+    assert stats["updated_param_count"] == 6
     assert torch.isfinite(torch.tensor(float(stats["update_rms_mean"]))).item()
     assert torch.isfinite(torch.tensor(float(stats["update_ratio_max"]))).item()
 

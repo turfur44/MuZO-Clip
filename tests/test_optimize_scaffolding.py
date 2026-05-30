@@ -80,9 +80,21 @@ def test_update_fast_path_rejects_unknown_value() -> None:
         MuZOClipOptimizer(TinyModel(), update_fast_path="bad")  # type: ignore[arg-type]
 
 
+def test_matrix_update_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="Unsupported matrix_update_mode"):
+        MuZOClipOptimizer(TinyModel(), matrix_update_mode="bad")  # type: ignore[arg-type]
+
+
+def test_batched_blocks_requires_fused_rademacher() -> None:
+    with pytest.raises(RuntimeError, match="requires fast_path_backend='fused_rademacher'"):
+        MuZOClipOptimizer(TinyModel(), matrix_update_mode="batched_blocks")
+
+
 def test_gpu_stats_apply_helper_has_no_item_sync() -> None:
     source = inspect.getsource(MuZOClipOptimizer._apply_update_gpu_stats)
     assert ".item(" not in source
+    batched_source = inspect.getsource(MuZOClipOptimizer._apply_update_batched_gpu_stats)
+    assert ".item(" not in batched_source
 
 
 def test_auto_block_rows_heuristic() -> None:

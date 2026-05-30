@@ -88,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distribution", choices=["normal", "rademacher"], default="normal")
     parser.add_argument("--fast_path_backend", choices=["torch", "fused_rademacher"], default="torch")
     parser.add_argument("--update_fast_path", choices=["torch", "gpu_stats"], default="torch")
+    parser.add_argument("--matrix_update_mode", choices=["block_loop", "batched_blocks"], default="block_loop")
     parser.add_argument("--sparse_update_mode", choices=["off", "round_robin"], default="off")
     parser.add_argument("--sparse_update_groups", type=int, default=1)
     parser.add_argument("--qk_clip_mode", choices=["none", "periodic_eager"], default="none")
@@ -280,6 +281,7 @@ def main() -> None:
         phase_profiler=phase_profiler,
         fast_path_backend=args.fast_path_backend,  # type: ignore[arg-type]
         update_fast_path=args.update_fast_path,  # type: ignore[arg-type]
+        matrix_update_mode=args.matrix_update_mode,  # type: ignore[arg-type]
         sparse_update_mode=args.sparse_update_mode,  # type: ignore[arg-type]
         sparse_update_groups=args.sparse_update_groups,
         full_block_max_elements=args.full_block_max_elements,
@@ -292,6 +294,7 @@ def main() -> None:
     logging.info("Token cache mode: %s", args.token_cache_mode)
     logging.info("Block rows: %s", args.block_rows)
     logging.info("Update fast path: %s", args.update_fast_path)
+    logging.info("Matrix update mode: %s", args.matrix_update_mode)
     logging.info("Sparse update: %s groups=%d", args.sparse_update_mode, args.sparse_update_groups)
 
     batch_iter = make_batch_iter(args, tokenizer, tokenizer_source)
@@ -383,6 +386,7 @@ def main() -> None:
                 "distribution": args.distribution,
                 "fast_path_backend": args.fast_path_backend,
                 "update_fast_path": args.update_fast_path,
+                "matrix_update_mode": args.matrix_update_mode,
                 "full_block_max_elements": args.full_block_max_elements,
                 "sparse_update_mode": args.sparse_update_mode,
                 "sparse_update_groups": args.sparse_update_groups,

@@ -64,3 +64,51 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
         return zeros
 
     return X.to(dtype=out_dtype)
+
+
+@torch.no_grad()
+def batched_zeropower_via_newtonschulz5(G_batch: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Batched Newton-Schulz orthogonalization for row-block MuZO updates.
+
+    ``G_batch`` must have shape ``[B, M, N]``.  The 2D implementation above is
+    intentionally left unchanged; this function mirrors its coefficients and
+    per-item normalization while using ``torch.bmm`` for the matrix products.
+    """
+
+    if G_batch.ndim != 3:
+        raise ValueError("batched_zeropower_via_newtonschulz5 accepts [B, M, N] tensors only")
+    if steps < 0:
+        raise ValueError("steps must be non-negative")
+
+    out_dtype = G_batch.dtype if G_batch.is_floating_point() else torch.float32
+    zeros = torch.zeros_like(G_batch, dtype=out_dtype)
+    if G_batch.numel() == 0:
+        return zeros
+
+    finite = torch.isfinite(G_batch).flatten(1).all(dim=1)
+    norms = G_batch.float().flatten(1).norm(dim=1)
+    valid = finite & torch.isfinite(norms) & (norms > 0)
+
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    compute_dtype = torch.bfloat16 if G_batch.device.type == "cuda" else torch.float32
+    X = G_batch.to(dtype=compute_dtype)
+
+    transposed = G_batch.size(1) > G_batch.size(2)
+    if transposed:
+        X = X.transpose(1, 2)
+
+    x_norms = X.float().flatten(1).norm(dim=1).clamp_min(1e-7).view(-1, 1, 1)
+    X = X / x_norms
+
+    for _ in range(int(steps)):
+        A = torch.bmm(X, X.transpose(1, 2))
+        B = b * A + c * torch.bmm(A, A)
+        X = a * X + torch.bmm(B, X)
+
+    if transposed:
+        X = X.transpose(1, 2)
+
+    output_finite = torch.isfinite(X).flatten(1).all(dim=1)
+    valid = valid & output_finite
+    X = X.to(dtype=out_dtype)
+    return torch.where(valid.view(-1, 1, 1), X, zeros)

@@ -17,6 +17,7 @@ triton = None
 tl = None
 _PERTURB_KERNEL = None
 _RECONSTRUCT_KERNEL = None
+_BATCHED_RECONSTRUCT_KERNEL = None
 _C_SEED_HI = 747796405
 _C_HASH_HI = 289133645
 _C_BLOCK = 668265263
@@ -170,6 +171,56 @@ def _get_reconstruct_kernel():
     return _RECONSTRUCT_KERNEL
 
 
+def _get_batched_reconstruct_kernel():
+    global _BATCHED_RECONSTRUCT_KERNEL
+    ensure_triton_available()
+    if _BATCHED_RECONSTRUCT_KERNEL is not None:
+        return _BATCHED_RECONSTRUCT_KERNEL
+
+    @triton.jit
+    def _kernel(
+        out_ptr,
+        seeds_ptr,
+        coeffs_ptr,
+        n_elements_per_block,
+        n_history: tl.constexpr,
+        hash_lo,
+        hash_hi,
+        block_start_index,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        batch_block_id = tl.program_id(1)
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements_per_block
+        zero = offsets * 0
+        hash_lo = (zero + hash_lo).to(tl.uint32)
+        hash_hi = (zero + hash_hi).to(tl.uint32)
+        block_index = (zero + block_start_index + batch_block_id).to(tl.uint32)
+        acc = tl.zeros((BLOCK_SIZE,), tl.float32)
+        for history_index in range(0, n_history):
+            seed = tl.load(seeds_ptr + history_index).to(tl.uint64)
+            seed_lo = seed.to(tl.uint32)
+            seed_hi = (seed >> 32).to(tl.uint32)
+            coeff = tl.load(coeffs_ptr + history_index).to(tl.float32)
+            x = offsets.to(tl.uint32)
+            x ^= seed_lo
+            x += seed_hi * 747796405
+            x ^= hash_lo
+            x += hash_hi * 289133645
+            x ^= block_index * 668265263
+            x ^= x >> 16
+            x *= 73244475
+            x ^= x >> 15
+            x *= 668265263
+            x ^= x >> 16
+            sign = tl.where((x & 1) == 0, -1.0, 1.0)
+            acc += coeff * sign
+        tl.store(out_ptr + batch_block_id * n_elements_per_block + offsets, acc, mask=mask)
+
+    _BATCHED_RECONSTRUCT_KERNEL = _kernel
+    return _BATCHED_RECONSTRUCT_KERNEL
+
+
 def fused_perturb_inplace_rademacher(
     param_block: torch.Tensor,
     *,
@@ -238,6 +289,57 @@ def fused_momentum_reconstruct_rademacher(
         hash_lo,
         hash_hi,
         int(block_index),
+        BLOCK_SIZE=256,
+    )
+
+
+def fused_momentum_reconstruct_rademacher_batched(
+    out_m_batch: torch.Tensor,
+    *,
+    seeds: torch.Tensor,
+    coeffs: torch.Tensor,
+    param_hash: int,
+    block_start_index: int,
+) -> None:
+    """Write batched counter-Rademacher reconstruction into ``out_m_batch``."""
+
+    ensure_triton_available()
+    _require_cuda_contiguous(out_m_batch, "out_m_batch")
+    if out_m_batch.dtype != torch.float32:
+        raise TypeError("out_m_batch must be float32")
+    if out_m_batch.ndim != 3:
+        raise ValueError("out_m_batch must have shape [B, block_rows, cols]")
+    if seeds.ndim != 1 or coeffs.ndim != 1 or seeds.numel() != coeffs.numel():
+        raise ValueError("seeds and coeffs must be 1D tensors with the same length")
+    if seeds.numel() == 0:
+        out_m_batch.zero_()
+        return
+    if seeds.device != out_m_batch.device or seeds.dtype != torch.int64:
+        seeds = seeds.to(device=out_m_batch.device, dtype=torch.int64, non_blocking=True)
+    if coeffs.device != out_m_batch.device or coeffs.dtype != torch.float32:
+        coeffs = coeffs.to(device=out_m_batch.device, dtype=torch.float32, non_blocking=True)
+    if not seeds.is_contiguous():
+        raise RuntimeError("seeds must be contiguous for fused_rademacher")
+    if not coeffs.is_contiguous():
+        raise RuntimeError("coeffs must be contiguous for fused_rademacher")
+    batch_blocks = int(out_m_batch.shape[0])
+    n_elements_per_block = int(out_m_batch.shape[1]) * int(out_m_batch.shape[2])
+    if batch_blocks == 0 or n_elements_per_block == 0:
+        out_m_batch.zero_()
+        return
+    hash_lo, hash_hi = _split_u64(param_hash)
+    kernel = _get_batched_reconstruct_kernel()
+    assert triton is not None
+    grid = (triton.cdiv(n_elements_per_block, 256), batch_blocks)
+    kernel[grid](
+        out_m_batch,
+        seeds,
+        coeffs,
+        n_elements_per_block,
+        int(seeds.numel()),
+        hash_lo,
+        hash_hi,
+        int(block_start_index),
         BLOCK_SIZE=256,
     )
 
