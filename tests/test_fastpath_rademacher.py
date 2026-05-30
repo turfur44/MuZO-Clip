@@ -211,6 +211,35 @@ def test_optimizer_fast_path_smoke() -> None:
     assert any(not torch.equal(param, before[name]) for name, param in model.named_parameters())
 
 
+def test_optimizer_fast_path_with_gpu_stats_update_smoke() -> None:
+    torch.manual_seed(6)
+    model = TinyLinearModel().cuda()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    opt = MuZOClipOptimizer(
+        model,
+        seed=12,
+        horizon=2,
+        min_history=1,
+        distribution="rademacher",
+        fast_path_backend="fused_rademacher",
+        update_fast_path="gpu_stats",
+        block_rows=None,
+    )
+
+    def loss() -> torch.Tensor:
+        return model.q_proj.weight.float().pow(2).mean() + model.down_proj.weight.float().pow(2).mean()
+
+    opt.estimate_projection(loss)
+    stats = opt.step()
+    torch.cuda.synchronize()
+
+    assert stats["skipped"] is False
+    assert stats["updated_param_count"] > 0
+    assert torch.isfinite(torch.tensor(float(stats["update_rms_mean"]))).item()
+    assert torch.isfinite(torch.tensor(float(stats["update_ratio_max"]))).item()
+
+
 def test_optimizer_fast_path_rejects_cpu_selected_param() -> None:
     model = TinyLinearModel()
     with pytest.raises(RuntimeError, match="q_proj.weight"):

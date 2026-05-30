@@ -48,9 +48,11 @@ def parse_block_rows(value: str) -> BlockRows:
         return None
     if lowered == "auto":
         return "auto"
+    if lowered == "auto_full":
+        return "auto_full"
     parsed = int(value)
     if parsed <= 0:
-        raise argparse.ArgumentTypeError("block_rows must be positive, none, full, or auto")
+        raise argparse.ArgumentTypeError("block_rows must be positive, none, full, auto, or auto_full")
     return parsed
 
 
@@ -78,12 +80,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update_ratio_clip", type=float, default=0.01)
     parser.add_argument("--muon_scale", type=float, default=0.2)
     parser.add_argument("--block_rows", type=parse_block_rows, default=256)
+    parser.add_argument("--full_block_max_elements", type=int, default=8_388_608)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16", "auto"], default="bfloat16")
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--loss_mode", choices=["assistant_only", "full_text"], default="assistant_only")
     parser.add_argument("--distribution", choices=["normal", "rademacher"], default="normal")
     parser.add_argument("--fast_path_backend", choices=["torch", "fused_rademacher"], default="torch")
+    parser.add_argument("--update_fast_path", choices=["torch", "gpu_stats"], default="torch")
     parser.add_argument("--sparse_update_mode", choices=["off", "round_robin"], default="off")
     parser.add_argument("--sparse_update_groups", type=int, default=1)
     parser.add_argument("--qk_clip_mode", choices=["none", "periodic_eager"], default="none")
@@ -117,6 +121,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("min_history must be less than or equal to horizon")
     if args.sparse_update_groups <= 0:
         raise ValueError("sparse_update_groups must be positive")
+    if args.full_block_max_elements <= 0:
+        raise ValueError("full_block_max_elements must be positive")
     if args.gc_every < 0:
         raise ValueError("gc_every must be non-negative")
     return args
@@ -273,8 +279,10 @@ def main() -> None:
         qk_clip_alpha=args.qk_clip_alpha,
         phase_profiler=phase_profiler,
         fast_path_backend=args.fast_path_backend,  # type: ignore[arg-type]
+        update_fast_path=args.update_fast_path,  # type: ignore[arg-type]
         sparse_update_mode=args.sparse_update_mode,  # type: ignore[arg-type]
         sparse_update_groups=args.sparse_update_groups,
+        full_block_max_elements=args.full_block_max_elements,
     )
     if not optimizer.selected_parameter_names():
         raise RuntimeError("MuZO-Clip selected no parameters")
@@ -283,6 +291,7 @@ def main() -> None:
     logging.info("QK-Clip mode: %s", args.qk_clip_mode)
     logging.info("Token cache mode: %s", args.token_cache_mode)
     logging.info("Block rows: %s", args.block_rows)
+    logging.info("Update fast path: %s", args.update_fast_path)
     logging.info("Sparse update: %s groups=%d", args.sparse_update_mode, args.sparse_update_groups)
 
     batch_iter = make_batch_iter(args, tokenizer, tokenizer_source)
@@ -373,6 +382,8 @@ def main() -> None:
                 "block_rows": str(args.block_rows),
                 "distribution": args.distribution,
                 "fast_path_backend": args.fast_path_backend,
+                "update_fast_path": args.update_fast_path,
+                "full_block_max_elements": args.full_block_max_elements,
                 "sparse_update_mode": args.sparse_update_mode,
                 "sparse_update_groups": args.sparse_update_groups,
                 "active_param_count": step_stats.get("active_param_count"),

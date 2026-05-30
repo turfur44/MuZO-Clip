@@ -13,7 +13,7 @@ import math
 import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 import torch
 
@@ -38,6 +38,8 @@ from .qk_clip import QKClipApplyStats, QKClipController
 from .sparse_schedule import SparseUpdateMode, names_hash, select_active_parameters
 
 logger = logging.getLogger(__name__)
+
+UpdateFastPath = Literal["torch", "gpu_stats"]
 
 
 @dataclass(frozen=True)
@@ -120,8 +122,10 @@ class MuZOClipOptimizer:
         qk_clip_alpha: float = 0.5,
         phase_profiler: PhaseProfiler | None = None,
         fast_path_backend: FastPathBackend = "torch",
+        update_fast_path: UpdateFastPath = "torch",
         sparse_update_mode: SparseUpdateMode = "off",
         sparse_update_groups: int = 1,
+        full_block_max_elements: int = 8_388_608,
     ):
         if horizon <= 0:
             raise ValueError("horizon must be positive")
@@ -139,6 +143,10 @@ class MuZOClipOptimizer:
             raise ValueError(f"Unsupported distribution: {distribution}")
         if sparse_update_groups <= 0:
             raise ValueError("sparse_update_groups must be positive")
+        if update_fast_path not in ("torch", "gpu_stats"):
+            raise ValueError(f"Unsupported update_fast_path: {update_fast_path}")
+        if full_block_max_elements <= 0:
+            raise ValueError("full_block_max_elements must be positive")
         require_supported_backend(fast_path_backend, distribution)
 
         self.model = model
@@ -154,6 +162,8 @@ class MuZOClipOptimizer:
         self.distribution = distribution
         self.block_rows = block_rows
         self.fast_path_backend = fast_path_backend
+        self.update_fast_path = update_fast_path
+        self.full_block_max_elements = int(full_block_max_elements)
         self.rollback = bool(rollback)
         self.restore_exact = bool(restore_exact)
         self.min_history = int(min_history)
@@ -170,6 +180,9 @@ class MuZOClipOptimizer:
             trainable_substrings=trainable_substrings,
             frozen_substrings=frozen_substrings,
         )
+        self._param_hashes = {
+            selected.name: param_hash64(selected.name, tuple(selected.param.shape)) for selected in self.selected_params
+        }
         if not self.selected_params:
             logger.warning("MuZO-Clip selected no parameters with the current filter")
         elif not self.restore_exact and self._has_low_precision_selected_params():
@@ -363,6 +376,8 @@ class MuZOClipOptimizer:
 
         lr = self.current_lr
         update_rms_values: list[float] = []
+        update_rms_tensors: list[torch.Tensor] = []
+        update_ratio_tensors: list[torch.Tensor] = []
         update_ratio_max = 0.0
         updated_param_count = 0
         active_params = self._pending_active_params
@@ -419,7 +434,11 @@ class MuZOClipOptimizer:
                         coeffs = [value / coeff_sum for value in coeffs]
                     fused_coeffs = torch.tensor(coeffs, device=param.device, dtype=torch.float32)
 
-            block_rows = resolve_block_rows(param.data, self.block_rows)
+            block_rows = resolve_block_rows(
+                param.data,
+                self.block_rows,
+                full_block_max_elements=self.full_block_max_elements,
+            )
             for block_index, _, block in iter_param_blocks(param.data, block_rows):
                 with self._phase("muzo_reconstruct"):
                     M = torch.empty(block.shape, device=block.device, dtype=torch.float32)
@@ -429,7 +448,7 @@ class MuZOClipOptimizer:
                             M,
                             seeds=fused_seeds,
                             coeffs=fused_coeffs,
-                            param_hash=param_hash64(selected.name, tuple(param.shape)),
+                            param_hash=self._param_hashes[selected.name],
                             block_index=block_index,
                         )
                     else:
@@ -455,29 +474,37 @@ class MuZOClipOptimizer:
                     U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
 
                 with self._phase("apply_update"):
-                    U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
-                    update_rms = _rms(U) * lr
-                    weight_rms = _rms(block)
-                    ratio = update_rms / (weight_rms + 1e-12)
-                    ratio_float = float(ratio.item())
-                    if ratio_float > self.update_ratio_clip:
-                        U.mul_(self.update_ratio_clip / ratio_float)
+                    if self.update_fast_path == "gpu_stats":
+                        update_rms_tensor, ratio_tensor = self._apply_update_gpu_stats(block, U, lr)
+                        update_rms_tensors.append(update_rms_tensor)
+                        update_ratio_tensors.append(ratio_tensor)
+                    else:
+                        U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
                         update_rms = _rms(U) * lr
-                        ratio_float = float((update_rms / (weight_rms + 1e-12)).item())
+                        weight_rms = _rms(block)
+                        ratio = update_rms / (weight_rms + 1e-12)
+                        ratio_float = float(ratio.item())
+                        if ratio_float > self.update_ratio_clip:
+                            U.mul_(self.update_ratio_clip / ratio_float)
+                            update_rms = _rms(U) * lr
+                            ratio_float = float((update_rms / (weight_rms + 1e-12)).item())
 
-                    block.add_(U.to(dtype=block.dtype), alpha=-lr)
-                    if self.weight_decay:
-                        block.mul_(1.0 - lr * self.weight_decay)
-
-                update_rms_values.append(float(update_rms.item()))
-                update_ratio_max = max(update_ratio_max, ratio_float)
+                        block.add_(U.to(dtype=block.dtype), alpha=-lr)
+                        if self.weight_decay:
+                            block.mul_(1.0 - lr * self.weight_decay)
+                        update_rms_values.append(float(update_rms.item()))
+                        update_ratio_max = max(update_ratio_max, ratio_float)
                 updated_param_count += 1
 
                 del M, U
 
         self._has_pending_update = False
         self._last_step_updated = updated_param_count > 0
-        mean_update_rms = sum(update_rms_values) / len(update_rms_values) if update_rms_values else 0.0
+        if self.update_fast_path == "gpu_stats" and update_rms_tensors:
+            mean_update_rms = float(torch.stack(update_rms_tensors).mean().item())
+            update_ratio_max = float(torch.stack(update_ratio_tensors).max().item())
+        else:
+            mean_update_rms = sum(update_rms_values) / len(update_rms_values) if update_rms_values else 0.0
         return StepStats(
             lr=lr,
             update_rms_mean=mean_update_rms,
@@ -488,6 +515,27 @@ class MuZOClipOptimizer:
             skipped=False,
             skip_reason=None,
         ).__dict__
+
+    def _apply_update_gpu_stats(
+        self,
+        block: torch.Tensor,
+        U: torch.Tensor,
+        lr: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
+        update_rms = _rms(U) * lr
+        weight_rms = _rms(block)
+        ratio = update_rms / (weight_rms + 1e-12)
+        clip = ratio.new_tensor(self.update_ratio_clip)
+        should_clip = ratio > clip
+        scale = torch.where(should_clip, clip / ratio.clamp_min(1e-12), torch.ones_like(ratio))
+        scaled_update_rms = torch.where(should_clip, clip * (weight_rms + 1e-12), update_rms)
+        scaled_ratio = torch.where(should_clip, clip, ratio)
+        U.mul_(scale)
+        block.add_(U.to(dtype=block.dtype), alpha=-lr)
+        if self.weight_decay:
+            block.mul_(1.0 - lr * self.weight_decay)
+        return scaled_update_rms.detach(), scaled_ratio.detach()
 
     @torch.no_grad()
     def apply_qk_clip_if_available(self) -> dict[str, object]:
@@ -562,7 +610,11 @@ class MuZOClipOptimizer:
                 raise RuntimeError(f"fused_rademacher only supports 2D selected param: {selected.name}")
             if not param.data.is_contiguous():
                 raise RuntimeError(f"fused_rademacher requires contiguous selected param: {selected.name}")
-            block_rows = resolve_block_rows(param.data, self.block_rows)
+            block_rows = resolve_block_rows(
+                param.data,
+                self.block_rows,
+                full_block_max_elements=self.full_block_max_elements,
+            )
             for block_index, _row_slice, block in iter_param_blocks(param.data, block_rows):
                 if not block.is_cuda or not block.is_contiguous():
                     raise RuntimeError(
@@ -580,13 +632,17 @@ class MuZOClipOptimizer:
         scale = float(scaling_factor) * self.zo_eps
         selected_items = selected_params if selected_params is not None else self.selected_params
         for selected in selected_items:
-            block_rows = resolve_block_rows(selected.param.data, self.block_rows)
+            block_rows = resolve_block_rows(
+                selected.param.data,
+                self.block_rows,
+                full_block_max_elements=self.full_block_max_elements,
+            )
             for block_index, _, block in iter_param_blocks(selected.param.data, block_rows):
                 if self.fast_path_backend == "fused_rademacher":
                     fused_perturb_inplace_rademacher(
                         block,
                         base_seed=seed,
-                        param_hash=param_hash64(selected.name, tuple(selected.param.shape)),
+                        param_hash=self._param_hashes[selected.name],
                         block_index=block_index,
                         scale=scale,
                     )
