@@ -11,20 +11,6 @@ from pathlib import Path
 from typing import Any
 
 VARIANTS: dict[str, dict[str, str]] = {
-    "torch_normal_256": {
-        "distribution": "normal",
-        "fast_path_backend": "torch",
-        "block_rows": "256",
-        "sparse_update_mode": "off",
-        "sparse_update_groups": "1",
-    },
-    "torch_rademacher_256": {
-        "distribution": "rademacher",
-        "fast_path_backend": "torch",
-        "block_rows": "256",
-        "sparse_update_mode": "off",
-        "sparse_update_groups": "1",
-    },
     "torch_rademacher_1024": {
         "distribution": "rademacher",
         "fast_path_backend": "torch",
@@ -43,6 +29,20 @@ VARIANTS: dict[str, dict[str, str]] = {
         "distribution": "rademacher",
         "fast_path_backend": "fused_rademacher",
         "block_rows": "auto",
+        "sparse_update_mode": "off",
+        "sparse_update_groups": "1",
+    },
+    "torch_normal_256": {
+        "distribution": "normal",
+        "fast_path_backend": "torch",
+        "block_rows": "256",
+        "sparse_update_mode": "off",
+        "sparse_update_groups": "1",
+    },
+    "torch_rademacher_256": {
+        "distribution": "rademacher",
+        "fast_path_backend": "torch",
+        "block_rows": "256",
         "sparse_update_mode": "off",
         "sparse_update_groups": "1",
     },
@@ -66,14 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text_column", default="text")
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=50)
+    parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--loss_mode", default="assistant_only")
-    parser.add_argument("--token_cache_mode", default="auto")
+    parser.add_argument("--token_cache_mode", default="require")
     parser.add_argument("--token_cache_root", default="token_cache")
-    parser.add_argument("--log_every", type=int, default=1)
+    parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--variant", choices=sorted(VARIANTS), default="fused_rademacher_auto")
+    parser.add_argument("--variants", default=None, help="Comma-separated variant list for dry_run/run modes")
     parser.add_argument("--extra_arg", action="append", default=[], help="Extra argument token appended verbatim")
     return parser.parse_args()
 
@@ -141,7 +142,16 @@ def run_command(command: list[str], log_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    selected = VARIANTS if args.mode != "profile_one" else {args.variant: VARIANTS[args.variant]}
+    if args.mode == "profile_one":
+        selected = {args.variant: VARIANTS[args.variant]}
+    elif args.variants:
+        names = [item.strip() for item in args.variants.split(",") if item.strip()]
+        unknown = [name for name in names if name not in VARIANTS]
+        if unknown:
+            raise SystemExit(f"Unknown variants: {', '.join(unknown)}")
+        selected = {name: VARIANTS[name] for name in names}
+    else:
+        selected = VARIANTS
     for name, config in selected.items():
         command = base_command(args, name, config)
         output_dir = Path(args.output_root) / name

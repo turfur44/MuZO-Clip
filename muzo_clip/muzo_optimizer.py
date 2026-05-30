@@ -182,6 +182,8 @@ class MuZOClipOptimizer:
             logger.warning("rollback=True snapshots selected params to CPU; avoid this for LLM-scale runs.")
         if self.restore_exact:
             logger.warning("restore_exact=True snapshots selected params to CPU; avoid this for LLM-scale runs.")
+        if fast_path_backend == "fused_rademacher":
+            self._validate_fused_rademacher_layout()
 
         self.history: deque[HistoryItem] = deque(maxlen=self.horizon)
         self.p_abs_ema: float = 0.0
@@ -366,30 +368,56 @@ class MuZOClipOptimizer:
         active_params = self._pending_active_params
         active_names = [item.name for item in active_params]
         active_names_set = set(active_names)
+        if not active_params:
+            self._has_pending_update = False
+            self._last_step_updated = False
+            self._clear_qk_clip_capture()
+            return StepStats(
+                lr=lr,
+                update_rms_mean=0.0,
+                update_ratio_max=0.0,
+                updated_param_count=0,
+                active_param_count=0,
+                active_param_names_hash="",
+                skipped=True,
+                skip_reason="no active selected parameters",
+            ).__dict__
+        fused_history_seeds: torch.Tensor | None = None
+        fused_shared_coeffs: torch.Tensor | None = None
+        if self.fast_path_backend == "fused_rademacher":
+            history_seeds = [int(item.seed) for item in reversed(self.history)]
+            fused_history_seeds = torch.tensor(history_seeds, device=active_params[0].param.device, dtype=torch.int64)
+            if self.sparse_update_mode == "off":
+                coeffs = [float((self.beta_momentum**age) * item.p) for age, item in enumerate(reversed(self.history))]
+                if self.normalize_momentum:
+                    coeff_sum = sum(self.beta_momentum**age for age, _item in enumerate(reversed(self.history)))
+                    if coeff_sum > 0:
+                        coeffs = [value / coeff_sum for value in coeffs]
+                fused_shared_coeffs = torch.tensor(coeffs, device=active_params[0].param.device, dtype=torch.float32)
 
         for selected in active_params:
             param = selected.param
-            history_seeds: list[int] = []
-            history_coeffs: list[float] = []
-            coeff_sum = 0.0
-            for age, item in enumerate(reversed(self.history)):
-                coeff = self.beta_momentum**age
-                active_for_param = item.active_param_names is None or selected.name in item.active_param_names
-                history_seeds.append(int(item.seed))
-                if active_for_param:
-                    history_coeffs.append(float(coeff * item.p))
-                    coeff_sum += coeff
-                else:
-                    history_coeffs.append(0.0)
-            if coeff_sum <= 0:
-                continue
-            if self.normalize_momentum:
-                history_coeffs = [value / coeff_sum for value in history_coeffs]
             fused_seeds: torch.Tensor | None = None
             fused_coeffs: torch.Tensor | None = None
             if self.fast_path_backend == "fused_rademacher":
-                fused_seeds = torch.tensor(history_seeds, device=param.device, dtype=torch.int64)
-                fused_coeffs = torch.tensor(history_coeffs, device=param.device, dtype=torch.float32)
+                fused_seeds = fused_history_seeds
+                if fused_shared_coeffs is not None:
+                    fused_coeffs = fused_shared_coeffs
+                else:
+                    coeffs: list[float] = []
+                    coeff_sum = 0.0
+                    for age, item in enumerate(reversed(self.history)):
+                        coeff = self.beta_momentum**age
+                        if item.active_param_names is None or selected.name in item.active_param_names:
+                            coeffs.append(float(coeff * item.p))
+                            coeff_sum += coeff
+                        else:
+                            coeffs.append(0.0)
+                    if coeff_sum <= 0:
+                        continue
+                    if self.normalize_momentum:
+                        coeffs = [value / coeff_sum for value in coeffs]
+                    fused_coeffs = torch.tensor(coeffs, device=param.device, dtype=torch.float32)
 
             block_rows = resolve_block_rows(param.data, self.block_rows)
             for block_index, _, block in iter_param_blocks(param.data, block_rows):
@@ -406,15 +434,22 @@ class MuZOClipOptimizer:
                         )
                     else:
                         M.zero_()
-                        for item_seed, item_coeff in zip(history_seeds, history_coeffs):
+                        coeff_sum = 0.0
+                        for age, item in enumerate(reversed(self.history)):
+                            if item.active_param_names is not None and selected.name not in item.active_param_names:
+                                continue
+                            coeff = self.beta_momentum**age
                             noise = make_zo_noise_like(
                                 block,
-                                item_seed,
+                                item.seed,
                                 selected.name,
                                 block_index=block_index,
                                 distribution=self.distribution,
                             ).float()
-                            M.add_(noise, alpha=item_coeff)
+                            M.add_(noise, alpha=coeff * item.p)
+                            coeff_sum += coeff
+                        if self.normalize_momentum and coeff_sum > 0:
+                            M.div_(coeff_sum)
 
                 with self._phase("newton_schulz"):
                     U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
@@ -515,6 +550,25 @@ class MuZOClipOptimizer:
 
     def _has_low_precision_selected_params(self) -> bool:
         return any(selected.param.dtype in (torch.float16, torch.bfloat16) for selected in self.selected_params)
+
+    def _validate_fused_rademacher_layout(self) -> None:
+        """Fail fast before fused kernels enter the hot path."""
+
+        for selected in self.selected_params:
+            param = selected.param
+            if not param.is_cuda:
+                raise RuntimeError(f"fused_rademacher requires CUDA tensor for selected param: {selected.name}")
+            if param.ndim != 2:
+                raise RuntimeError(f"fused_rademacher only supports 2D selected param: {selected.name}")
+            if not param.data.is_contiguous():
+                raise RuntimeError(f"fused_rademacher requires contiguous selected param: {selected.name}")
+            block_rows = resolve_block_rows(param.data, self.block_rows)
+            for block_index, _row_slice, block in iter_param_blocks(param.data, block_rows):
+                if not block.is_cuda or not block.is_contiguous():
+                    raise RuntimeError(
+                        "fused_rademacher requires CUDA contiguous row blocks for "
+                        f"selected param: {selected.name} block_index={block_index}"
+                    )
 
     @torch.no_grad()
     def _perturb_selected(

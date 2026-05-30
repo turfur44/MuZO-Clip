@@ -211,6 +211,28 @@ def test_optimizer_fast_path_smoke() -> None:
     assert any(not torch.equal(param, before[name]) for name, param in model.named_parameters())
 
 
+def test_optimizer_fast_path_rejects_cpu_selected_param() -> None:
+    model = TinyLinearModel()
+    with pytest.raises(RuntimeError, match="q_proj.weight"):
+        MuZOClipOptimizer(
+            model,
+            distribution="rademacher",
+            fast_path_backend="fused_rademacher",
+        )
+
+
+def test_optimizer_fast_path_rejects_noncontiguous_selected_param() -> None:
+    model = TinyLinearModel().cuda()
+    model.q_proj.weight = torch.nn.Parameter(torch.empty(8, 8, device="cuda").t())
+    assert not model.q_proj.weight.is_contiguous()
+    with pytest.raises(RuntimeError, match="q_proj.weight"):
+        MuZOClipOptimizer(
+            model,
+            distribution="rademacher",
+            fast_path_backend="fused_rademacher",
+        )
+
+
 def test_fused_backend_raises_clear_error_when_triton_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     import muzo_clip.fastpath as fastpath
 

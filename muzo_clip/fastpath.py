@@ -218,8 +218,14 @@ def fused_momentum_reconstruct_rademacher(
     if seeds.numel() == 0:
         out_m.zero_()
         return
-    seeds = seeds.to(device=out_m.device, dtype=torch.int64, non_blocking=True).contiguous()
-    coeffs = coeffs.to(device=out_m.device, dtype=torch.float32, non_blocking=True).contiguous()
+    if seeds.device != out_m.device or seeds.dtype != torch.int64:
+        seeds = seeds.to(device=out_m.device, dtype=torch.int64, non_blocking=True)
+    if coeffs.device != out_m.device or coeffs.dtype != torch.float32:
+        coeffs = coeffs.to(device=out_m.device, dtype=torch.float32, non_blocking=True)
+    if not seeds.is_contiguous():
+        raise RuntimeError("seeds must be contiguous for fused_rademacher")
+    if not coeffs.is_contiguous():
+        raise RuntimeError("coeffs must be contiguous for fused_rademacher")
     hash_lo, hash_hi = _split_u64(param_hash)
     kernel = _get_reconstruct_kernel()
     numel = int(out_m.numel())

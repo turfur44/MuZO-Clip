@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("logs", nargs="+", help="JSONL train.log files or directories containing train.log")
     parser.add_argument("--csv", default=None)
     parser.add_argument("--json", default=None)
+    parser.add_argument("--warmup_rows", type=int, default=3)
     return parser.parse_args()
 
 
@@ -44,22 +45,28 @@ def resolve_logs(inputs: list[str]) -> list[Path]:
     return paths
 
 
-def summarize_one(path: Path) -> dict[str, Any]:
+def summarize_one(path: Path, warmup_rows: int) -> dict[str, Any]:
     rows = list(iter_log_rows(path))
     if not rows:
         raise ValueError(f"No JSON rows found in {path}")
+    metric_rows = rows[max(0, int(warmup_rows)) :]
+    if not metric_rows:
+        metric_rows = rows
     variant = rows[-1].get("variant_name") or rows[-1].get("fast_path_backend") or path.parent.name
-    tokens = [float(row["tokens_per_second"]) for row in rows if row.get("tokens_per_second") is not None]
-    steps = [float(row["steps_per_second"]) for row in rows if row.get("steps_per_second") is not None]
-    forward = [float(row["forward_time_ms"]) for row in rows if row.get("forward_time_ms") is not None]
-    update = [float(row["update_time_ms"]) for row in rows if row.get("update_time_ms") is not None]
+    tokens = [float(row["tokens_per_second"]) for row in metric_rows if row.get("tokens_per_second") is not None]
+    steps = [float(row["steps_per_second"]) for row in metric_rows if row.get("steps_per_second") is not None]
+    forward = [float(row["forward_time_ms"]) for row in metric_rows if row.get("forward_time_ms") is not None]
+    update = [float(row["update_time_ms"]) for row in metric_rows if row.get("update_time_ms") is not None]
     peaks = [int(row["gpu_memory_peak"]) for row in rows if row.get("gpu_memory_peak") is not None]
-    skipped = sum(1 for row in rows if row.get("step_skipped") or row.get("projection_skipped"))
+    projection_skipped = sum(1 for row in rows if row.get("projection_skipped"))
+    step_skipped = sum(1 for row in rows if row.get("step_skipped"))
     final = rows[-1]
     return {
         "log": str(path),
         "variant": variant,
         "rows": len(rows),
+        "warmup_rows": min(max(0, int(warmup_rows)), len(rows)),
+        "metric_rows": len(metric_rows),
         "tokens_per_second_mean": mean(tokens) if tokens else None,
         "tokens_per_second_last": tokens[-1] if tokens else None,
         "steps_per_second_mean": mean(steps) if steps else None,
@@ -68,7 +75,11 @@ def summarize_one(path: Path) -> dict[str, Any]:
         "update_time_ms_mean": mean(update) if update else None,
         "gpu_memory_peak_max": max(peaks) if peaks else None,
         "final_loss_mean": final.get("loss_mean"),
-        "skipped_steps": skipped,
+        "final_p_used": final.get("p_used"),
+        "final_update_ratio_max": final.get("update_ratio_max"),
+        "projection_skipped_count": projection_skipped,
+        "step_skipped_count": step_skipped,
+        "skipped_steps": projection_skipped + step_skipped,
         "final_step": final.get("step"),
         "distribution": final.get("distribution"),
         "fast_path_backend": final.get("fast_path_backend"),
@@ -80,7 +91,7 @@ def summarize_one(path: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    summaries = [summarize_one(path) for path in resolve_logs(args.logs)]
+    summaries = [summarize_one(path, args.warmup_rows) for path in resolve_logs(args.logs)]
     for row in summaries:
         print(json.dumps(row, sort_keys=True), flush=True)
     if args.json:

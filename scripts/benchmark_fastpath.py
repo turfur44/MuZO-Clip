@@ -28,6 +28,7 @@ from muzo_clip.fastpath import (
 
 SHAPES = [(1024, 1024), (4096, 4096), (4096, 11008), (11008, 4096)]
 HISTORY_LENGTHS = [1, 4, 8]
+BLOCK_ROWS_CASES: list[int | None] = [512, 1024, None]
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 MASK32 = (1 << 32) - 1
 
@@ -41,6 +42,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_bf16", action="store_true")
     parser.add_argument("--max_shape_elements", type=int, default=0, help="0 means run all configured shapes")
     return parser.parse_args()
+
+
+def block_cases(matrix_shape: tuple[int, int], block_rows: int | None) -> list[tuple[int, tuple[int, int]]]:
+    if block_rows is None:
+        return [(0, matrix_shape)]
+    rows, cols = matrix_shape
+    cases: list[tuple[int, tuple[int, int]]] = []
+    seen: set[tuple[int, int]] = set()
+    for block_index, start in enumerate(range(0, rows, block_rows)):
+        block_shape = (min(block_rows, rows - start), cols)
+        if block_shape not in seen:
+            cases.append((block_index, block_shape))
+            seen.add(block_shape)
+    return cases
+
+
+def block_rows_label(block_rows: int | None) -> str:
+    return "full" if block_rows is None else str(block_rows)
+
+
+def correctness_fail(message: str, **case: object) -> None:
+    payload = {"error": message, **case}
+    print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
+    raise SystemExit(1)
 
 
 def cuda_time_ms(fn, *, warmup: int, iters: int) -> float:
@@ -105,37 +130,72 @@ def check_counter_reference(shape: tuple[int, int], seed: int, param_hash: int, 
         raise AssertionError(f"torch counter reference mismatch for shape={small_shape}")
 
 
-def check_perturb(shape: tuple[int, int], dtype: torch.dtype, seed: int, param_hash: int) -> None:
-    check_counter_reference(shape, seed, param_hash, 0)
+def check_sign_sensitivity(shape: tuple[int, int], seed: int, param_hash: int, block_index: int) -> None:
+    base = counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=block_index, device=torch.device("cuda"))
+    same = counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=block_index, device=torch.device("cuda"))
+    if not torch.equal(base, same):
+        correctness_fail("same seed/hash/block produced different signs", shape=shape, block_index=block_index)
+    changed_seed = counter_rademacher_torch(shape, base_seed=seed + 1, param_hash=param_hash, block_index=block_index, device=torch.device("cuda"))
+    changed_hash = counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash + 1, block_index=block_index, device=torch.device("cuda"))
+    changed_block = counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=block_index + 1, device=torch.device("cuda"))
+    if torch.equal(base, changed_seed):
+        correctness_fail("different seed did not change signs", shape=shape, block_index=block_index)
+    if torch.equal(base, changed_hash):
+        correctness_fail("different hash did not change signs", shape=shape, block_index=block_index)
+    if torch.equal(base, changed_block):
+        correctness_fail("different block did not change signs", shape=shape, block_index=block_index)
+
+
+def check_perturb(shape: tuple[int, int], dtype: torch.dtype, seed: int, param_hash: int, block_index: int) -> None:
+    check_counter_reference(shape, seed, param_hash, block_index)
+    check_sign_sensitivity((min(shape[0], 64), min(shape[1], 64)), seed, param_hash, block_index)
     fused = torch.zeros(shape, device="cuda", dtype=dtype)
     torch_path = torch.zeros_like(fused)
-    fused_perturb_inplace_rademacher(fused, base_seed=seed, param_hash=param_hash, block_index=0, scale=1.0)
-    torch_path.add_(counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=0, device=fused.device).to(dtype))
+    fused_perturb_inplace_rademacher(fused, base_seed=seed, param_hash=param_hash, block_index=block_index, scale=1.0)
+    torch_path.add_(counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=block_index, device=fused.device).to(dtype))
     torch.cuda.synchronize()
     if not torch.equal(fused, torch_path):
         max_diff = float((fused.float() - torch_path.float()).abs().max().item())
-        raise AssertionError(f"perturb mismatch shape={shape} dtype={dtype} max_diff={max_diff}")
+        correctness_fail("perturb mismatch", shape=shape, dtype=str(dtype), block_index=block_index, max_diff=max_diff)
 
     restored = fused.clone()
-    fused_perturb_inplace_rademacher(restored, base_seed=seed, param_hash=param_hash, block_index=0, scale=-1.0)
+    fused_perturb_inplace_rademacher(restored, base_seed=seed, param_hash=param_hash, block_index=block_index, scale=-1.0)
     torch.cuda.synchronize()
     if dtype == torch.float32 and float(restored.abs().max().item()) != 0.0:
-        raise AssertionError(f"fp32 perturb restore was not exact for shape={shape}")
+        correctness_fail("fp32 perturb restore was not exact", shape=shape, block_index=block_index)
 
 
-def check_reconstruct(shape: tuple[int, int], h: int, param_hash: int) -> tuple[torch.Tensor, torch.Tensor]:
+def check_reconstruct(shape: tuple[int, int], h: int, param_hash: int, block_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     seeds = torch.tensor([1009 + i * 104729 for i in range(h)], device="cuda", dtype=torch.int64)
     coeffs = torch.tensor([((-1.0) ** i) * (0.5 + 0.125 * i) for i in range(h)], device="cuda", dtype=torch.float32)
     out = torch.empty(shape, device="cuda", dtype=torch.float32)
-    fused_momentum_reconstruct_rademacher(out, seeds=seeds, coeffs=coeffs, param_hash=param_hash, block_index=0)
+    fused_momentum_reconstruct_rademacher(out, seeds=seeds, coeffs=coeffs, param_hash=param_hash, block_index=block_index)
     ref = torch.zeros(shape, device="cuda", dtype=torch.float32)
     for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
         ref.add_(
-            counter_rademacher_torch(shape, base_seed=int(seed), param_hash=param_hash, block_index=0, device=out.device),
+            counter_rademacher_torch(shape, base_seed=int(seed), param_hash=param_hash, block_index=block_index, device=out.device),
             alpha=float(coeff),
         )
     torch.cuda.synchronize()
-    torch.testing.assert_close(out, ref, rtol=0.0, atol=1e-6)
+    try:
+        torch.testing.assert_close(out, ref, rtol=0.0, atol=1e-6)
+    except AssertionError as exc:
+        correctness_fail("reconstruct mismatch", shape=shape, history=h, block_index=block_index, detail=str(exc))
+    zero_coeffs = coeffs.clone()
+    if h > 1:
+        zero_coeffs[1::2] = 0.0
+        fused_momentum_reconstruct_rademacher(out, seeds=seeds, coeffs=zero_coeffs, param_hash=param_hash, block_index=block_index)
+        ref.zero_()
+        for seed, coeff in zip(seeds.cpu().tolist(), zero_coeffs.cpu().tolist()):
+            ref.add_(
+                counter_rademacher_torch(shape, base_seed=int(seed), param_hash=param_hash, block_index=block_index, device=out.device),
+                alpha=float(coeff),
+            )
+        torch.cuda.synchronize()
+        try:
+            torch.testing.assert_close(out, ref, rtol=0.0, atol=1e-6)
+        except AssertionError as exc:
+            correctness_fail("reconstruct zero-coeff mismatch", shape=shape, history=h, block_index=block_index, detail=str(exc))
     return seeds, coeffs
 
 
@@ -161,84 +221,104 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     started = time.time()
 
-    for shape in SHAPES:
-        if args.max_shape_elements and shape[0] * shape[1] > args.max_shape_elements:
+    for matrix_shape in SHAPES:
+        if args.max_shape_elements and matrix_shape[0] * matrix_shape[1] > args.max_shape_elements:
             continue
-        param_hash = param_hash64("benchmark.q_proj.weight", shape)
-        for dtype_name in dtypes:
-            dtype = DTYPES[dtype_name]
-            seed = (1 << 63) - 12345
-            check_perturb(shape, dtype, seed, param_hash)
-            fused_tensor = torch.zeros(shape, device="cuda", dtype=dtype)
-            torch_tensor = torch.zeros_like(fused_tensor)
+        param_hash = param_hash64("benchmark.q_proj.weight", matrix_shape)
+        for block_rows in BLOCK_ROWS_CASES:
+            for block_index, shape in block_cases(matrix_shape, block_rows):
+                for dtype_name in dtypes:
+                    dtype = DTYPES[dtype_name]
+                    seed = (1 << 63) - 12345
+                    check_perturb(shape, dtype, seed, param_hash, block_index)
+                    fused_tensor = torch.zeros(shape, device="cuda", dtype=dtype)
+                    torch_tensor = torch.zeros_like(fused_tensor)
 
-            def fused_perturb():
-                fused_perturb_inplace_rademacher(
-                    fused_tensor,
-                    base_seed=seed,
-                    param_hash=param_hash,
-                    block_index=0,
-                    scale=1e-3,
-                )
+                    def fused_perturb():
+                        fused_perturb_inplace_rademacher(
+                            fused_tensor,
+                            base_seed=seed,
+                            param_hash=param_hash,
+                            block_index=block_index,
+                            scale=1e-3,
+                        )
 
-            def torch_perturb():
-                torch_tensor.add_(
-                    counter_rademacher_torch(shape, base_seed=seed, param_hash=param_hash, block_index=0, device=torch_tensor.device).to(dtype),
-                    alpha=1e-3,
-                )
+                    def torch_perturb():
+                        torch_tensor.add_(
+                            counter_rademacher_torch(
+                                shape,
+                                base_seed=seed,
+                                param_hash=param_hash,
+                                block_index=block_index,
+                                device=torch_tensor.device,
+                            ).to(dtype),
+                            alpha=1e-3,
+                        )
 
-            fused_ms = cuda_time_ms(fused_perturb, warmup=args.warmup, iters=args.iters)
-            torch_ms = cuda_time_ms(torch_perturb, warmup=args.warmup, iters=args.iters)
-            rows.append(
-                {
-                    "benchmark": "perturb",
-                    "shape": f"{shape[0]}x{shape[1]}",
-                    "history": None,
-                    "dtype": dtype_name,
-                    "fused_ms": fused_ms,
-                    "torch_ms": torch_ms,
-                    "speedup": torch_ms / fused_ms if fused_ms > 0 else None,
-                    "elements": shape[0] * shape[1],
-                }
-            )
-            print(json.dumps(rows[-1], sort_keys=True), flush=True)
-
-        for h in HISTORY_LENGTHS:
-            seeds, coeffs = check_reconstruct(shape, h, param_hash)
-            fused_out = torch.empty(shape, device="cuda", dtype=torch.float32)
-
-            def fused_reconstruct():
-                fused_momentum_reconstruct_rademacher(
-                    fused_out,
-                    seeds=seeds,
-                    coeffs=coeffs,
-                    param_hash=param_hash,
-                    block_index=0,
-                )
-
-            def torch_reconstruct():
-                ref = torch.zeros(shape, device="cuda", dtype=torch.float32)
-                for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
-                    ref.add_(
-                        counter_rademacher_torch(shape, base_seed=int(seed), param_hash=param_hash, block_index=0, device=ref.device),
-                        alpha=float(coeff),
+                    fused_ms = cuda_time_ms(fused_perturb, warmup=args.warmup, iters=args.iters)
+                    torch_ms = cuda_time_ms(torch_perturb, warmup=args.warmup, iters=args.iters)
+                    rows.append(
+                        {
+                            "benchmark": "perturb",
+                            "matrix_shape": f"{matrix_shape[0]}x{matrix_shape[1]}",
+                            "block_rows": block_rows_label(block_rows),
+                            "block_index": block_index,
+                            "shape": f"{shape[0]}x{shape[1]}",
+                            "history": None,
+                            "dtype": dtype_name,
+                            "fused_ms": fused_ms,
+                            "torch_ms": torch_ms,
+                            "speedup": torch_ms / fused_ms if fused_ms > 0 else None,
+                            "elements": shape[0] * shape[1],
+                        }
                     )
+                    print(json.dumps(rows[-1], sort_keys=True), flush=True)
 
-            fused_ms = cuda_time_ms(fused_reconstruct, warmup=args.warmup, iters=args.iters)
-            torch_ms = cuda_time_ms(torch_reconstruct, warmup=args.warmup, iters=args.iters)
-            rows.append(
-                {
-                    "benchmark": "reconstruct",
-                    "shape": f"{shape[0]}x{shape[1]}",
-                    "history": h,
-                    "dtype": "fp32",
-                    "fused_ms": fused_ms,
-                    "torch_ms": torch_ms,
-                    "speedup": torch_ms / fused_ms if fused_ms > 0 else None,
-                    "elements": shape[0] * shape[1],
-                }
-            )
-            print(json.dumps(rows[-1], sort_keys=True), flush=True)
+                for h in HISTORY_LENGTHS:
+                    seeds, coeffs = check_reconstruct(shape, h, param_hash, block_index)
+                    fused_out = torch.empty(shape, device="cuda", dtype=torch.float32)
+
+                    def fused_reconstruct():
+                        fused_momentum_reconstruct_rademacher(
+                            fused_out,
+                            seeds=seeds,
+                            coeffs=coeffs,
+                            param_hash=param_hash,
+                            block_index=block_index,
+                        )
+
+                    def torch_reconstruct():
+                        ref = torch.zeros(shape, device="cuda", dtype=torch.float32)
+                        for seed, coeff in zip(seeds.cpu().tolist(), coeffs.cpu().tolist()):
+                            ref.add_(
+                                counter_rademacher_torch(
+                                    shape,
+                                    base_seed=int(seed),
+                                    param_hash=param_hash,
+                                    block_index=block_index,
+                                    device=ref.device,
+                                ),
+                                alpha=float(coeff),
+                            )
+
+                    fused_ms = cuda_time_ms(fused_reconstruct, warmup=args.warmup, iters=args.iters)
+                    torch_ms = cuda_time_ms(torch_reconstruct, warmup=args.warmup, iters=args.iters)
+                    rows.append(
+                        {
+                            "benchmark": "reconstruct",
+                            "matrix_shape": f"{matrix_shape[0]}x{matrix_shape[1]}",
+                            "block_rows": block_rows_label(block_rows),
+                            "block_index": block_index,
+                            "shape": f"{shape[0]}x{shape[1]}",
+                            "history": h,
+                            "dtype": "fp32",
+                            "fused_ms": fused_ms,
+                            "torch_ms": torch_ms,
+                            "speedup": torch_ms / fused_ms if fused_ms > 0 else None,
+                            "elements": shape[0] * shape[1],
+                        }
+                    )
+                    print(json.dumps(rows[-1], sort_keys=True), flush=True)
 
     for row in rows:
         row["elapsed_wall_sec"] = time.time() - started
