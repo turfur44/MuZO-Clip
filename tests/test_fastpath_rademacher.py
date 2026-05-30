@@ -10,6 +10,7 @@ from muzo_clip.fastpath import (
     fused_perturb_inplace_rademacher,
     param_hash64,
     rademacher_counter_reference,
+    require_supported_backend,
 )
 from muzo_clip.muzo_optimizer import MuZOClipOptimizer
 
@@ -61,6 +62,59 @@ def test_fused_perturb_deterministic() -> None:
     assert not torch.equal(a, c)
 
 
+def test_fused_perturb_large_seed_hash_matches_counter_reference() -> None:
+    shape = (257,)
+    cases = [
+        ((1 << 63) - 123, (1 << 63) - 456, 7),
+        (0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 12345),
+        (1234567890123456789, 9876543210987654321, 999999),
+    ]
+    for seed, param_hash, block_index in cases:
+        out = torch.zeros(shape, device="cuda", dtype=torch.float32)
+        fused_perturb_inplace_rademacher(
+            out,
+            base_seed=seed,
+            param_hash=param_hash,
+            block_index=block_index,
+            scale=1.0,
+        )
+        torch.cuda.synchronize()
+        expected = rademacher_counter_reference(
+            shape,
+            base_seed=seed,
+            param_hash=param_hash,
+            block_index=block_index,
+            device="cuda",
+        )
+        assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_perturb_low_precision_compiles(dtype: torch.dtype) -> None:
+    weight = torch.zeros((16, 16), device="cuda", dtype=dtype)
+    fused_perturb_inplace_rademacher(
+        weight,
+        base_seed=77,
+        param_hash=param_hash64("layers.0.k_proj.weight", tuple(weight.shape)),
+        block_index=0,
+        scale=0.25,
+    )
+    torch.cuda.synchronize()
+    assert set(weight.float().unique().cpu().tolist()) == {-0.25, 0.25}
+
+
+def test_fused_perturb_rejects_non_contiguous() -> None:
+    weight = torch.zeros((8, 8), device="cuda", dtype=torch.float32).t()
+    with pytest.raises(RuntimeError, match="contiguous"):
+        fused_perturb_inplace_rademacher(
+            weight,
+            base_seed=1,
+            param_hash=param_hash64("layers.0.v_proj.weight", tuple(weight.shape)),
+            block_index=0,
+            scale=1.0,
+        )
+
+
 @pytest.mark.parametrize("history_len", [1, 4, 8])
 @pytest.mark.parametrize("normalize", [False, True])
 def test_fused_reconstruct_matches_counter_reference(history_len: int, normalize: bool) -> None:
@@ -74,15 +128,14 @@ def test_fused_reconstruct_matches_counter_reference(history_len: int, normalize
     )
     out = torch.empty(shape, device="cuda", dtype=torch.float32)
     normalizer = float(sum(0.9**i for i in range(history_len)))
+    kernel_coeffs = coeffs / normalizer if normalize else coeffs
 
     fused_momentum_reconstruct_rademacher(
         out,
         seeds=seeds,
-        coeffs=coeffs,
+        coeffs=kernel_coeffs,
         param_hash=param_hash,
         block_index=3,
-        normalize=normalize,
-        normalizer=normalizer,
     )
     torch.cuda.synchronize()
 
@@ -117,8 +170,6 @@ def test_fused_reconstruct_sparse_coeff_zero_case() -> None:
         coeffs=torch.zeros(3, device="cuda", dtype=torch.float32),
         param_hash=param_hash,
         block_index=0,
-        normalize=True,
-        normalizer=2.71,
     )
     torch.cuda.synchronize()
     assert torch.equal(out, torch.zeros_like(out))
@@ -158,3 +209,21 @@ def test_optimizer_fast_path_smoke() -> None:
     assert stats["updated_param_count"] > 0
     assert all(torch.isfinite(param).all().item() for param in model.parameters())
     assert any(not torch.equal(param, before[name]) for name, param in model.named_parameters())
+
+
+def test_fused_backend_raises_clear_error_when_triton_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import muzo_clip.fastpath as fastpath
+
+    monkeypatch.setattr(fastpath, "triton", None)
+    monkeypatch.setattr(fastpath, "tl", None)
+
+    original_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "triton" or name == "triton.language":
+            raise ImportError("mock missing triton")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    with pytest.raises(ImportError, match="muzo-clip\\[fast\\]"):
+        require_supported_backend("fused_rademacher", "rademacher")

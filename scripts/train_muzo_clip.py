@@ -332,7 +332,7 @@ def main() -> None:
 
             tokens_seen += int(input_ids.numel())
             supervised_tokens_seen += supervised_tokens
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and (args.profile_phases or args.torch_profile):
                 torch.cuda.synchronize()
             mem_alloc, mem_peak = gpu_memory_stats()
             phase_summary = phase_profiler.current_summary()

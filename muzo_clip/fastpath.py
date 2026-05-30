@@ -96,6 +96,12 @@ def _get_perturb_kernel():
     ):
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
+        zero = offsets * 0
+        seed_lo = (zero + seed_lo).to(tl.uint32)
+        seed_hi = (zero + seed_hi).to(tl.uint32)
+        hash_lo = (zero + hash_lo).to(tl.uint32)
+        hash_hi = (zero + hash_hi).to(tl.uint32)
+        block_index = (zero + block_index).to(tl.uint32)
         x = offsets.to(tl.uint32)
         x ^= seed_lo
         x += seed_hi * 747796405
@@ -131,12 +137,14 @@ def _get_reconstruct_kernel():
         hash_lo,
         hash_hi,
         block_index,
-        normalize: tl.constexpr,
-        normalizer,
         BLOCK_SIZE: tl.constexpr,
     ):
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
+        zero = offsets * 0
+        hash_lo = (zero + hash_lo).to(tl.uint32)
+        hash_hi = (zero + hash_hi).to(tl.uint32)
+        block_index = (zero + block_index).to(tl.uint32)
         acc = tl.zeros((BLOCK_SIZE,), tl.float32)
         for history_index in range(0, n_history):
             seed = tl.load(seeds_ptr + history_index).to(tl.uint64)
@@ -156,8 +164,6 @@ def _get_reconstruct_kernel():
             x ^= x >> 16
             sign = tl.where((x & 1) == 0, -1.0, 1.0)
             acc += coeff * sign
-        if normalize:
-            acc = acc / normalizer
         tl.store(out_ptr + offsets, acc, mask=mask)
 
     _RECONSTRUCT_KERNEL = _kernel
@@ -200,8 +206,6 @@ def fused_momentum_reconstruct_rademacher(
     coeffs: torch.Tensor,
     param_hash: int,
     block_index: int,
-    normalize: bool,
-    normalizer: float = 1.0,
 ) -> None:
     """Write fused counter-Rademacher momentum reconstruction into ``out_m``."""
 
@@ -217,9 +221,6 @@ def fused_momentum_reconstruct_rademacher(
     seeds = seeds.to(device=out_m.device, dtype=torch.int64, non_blocking=True).contiguous()
     coeffs = coeffs.to(device=out_m.device, dtype=torch.float32, non_blocking=True).contiguous()
     hash_lo, hash_hi = _split_u64(param_hash)
-    if normalize and normalizer <= 0.0:
-        out_m.zero_()
-        return
     kernel = _get_reconstruct_kernel()
     numel = int(out_m.numel())
     kernel[_launch_grid(numel)](
@@ -231,8 +232,6 @@ def fused_momentum_reconstruct_rademacher(
         hash_lo,
         hash_hi,
         int(block_index),
-        bool(normalize),
-        float(normalizer),
         BLOCK_SIZE=256,
     )
 

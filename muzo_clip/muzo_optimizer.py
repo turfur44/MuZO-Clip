@@ -369,32 +369,40 @@ class MuZOClipOptimizer:
 
         for selected in active_params:
             param = selected.param
+            history_seeds: list[int] = []
+            history_coeffs: list[float] = []
+            coeff_sum = 0.0
+            for age, item in enumerate(reversed(self.history)):
+                coeff = self.beta_momentum**age
+                active_for_param = item.active_param_names is None or selected.name in item.active_param_names
+                history_seeds.append(int(item.seed))
+                if active_for_param:
+                    history_coeffs.append(float(coeff * item.p))
+                    coeff_sum += coeff
+                else:
+                    history_coeffs.append(0.0)
+            if coeff_sum <= 0:
+                continue
+            if self.normalize_momentum:
+                history_coeffs = [value / coeff_sum for value in history_coeffs]
+            fused_seeds: torch.Tensor | None = None
+            fused_coeffs: torch.Tensor | None = None
+            if self.fast_path_backend == "fused_rademacher":
+                fused_seeds = torch.tensor(history_seeds, device=param.device, dtype=torch.int64)
+                fused_coeffs = torch.tensor(history_coeffs, device=param.device, dtype=torch.float32)
+
             block_rows = resolve_block_rows(param.data, self.block_rows)
             for block_index, _, block in iter_param_blocks(param.data, block_rows):
                 with self._phase("muzo_reconstruct"):
                     M = torch.empty(block.shape, device=block.device, dtype=torch.float32)
-                    coeff_sum = 0.0
-                    history_seeds: list[int] = []
-                    history_coeffs: list[float] = []
-                    for age, item in enumerate(reversed(self.history)):
-                        if item.active_param_names is not None and selected.name not in item.active_param_names:
-                            continue
-                        coeff = self.beta_momentum**age
-                        history_seeds.append(int(item.seed))
-                        history_coeffs.append(float(coeff * item.p))
-                        coeff_sum += coeff
-                    if coeff_sum <= 0:
-                        del M
-                        continue
                     if self.fast_path_backend == "fused_rademacher":
+                        assert fused_seeds is not None and fused_coeffs is not None
                         fused_momentum_reconstruct_rademacher(
                             M,
-                            seeds=torch.tensor(history_seeds, device=block.device, dtype=torch.int64),
-                            coeffs=torch.tensor(history_coeffs, device=block.device, dtype=torch.float32),
-                            param_hash=param_hash64(selected.name, tuple(block.shape)),
+                            seeds=fused_seeds,
+                            coeffs=fused_coeffs,
+                            param_hash=param_hash64(selected.name, tuple(param.shape)),
                             block_index=block_index,
-                            normalize=self.normalize_momentum,
-                            normalizer=coeff_sum,
                         )
                     else:
                         M.zero_()
@@ -407,14 +415,9 @@ class MuZOClipOptimizer:
                                 distribution=self.distribution,
                             ).float()
                             M.add_(noise, alpha=item_coeff)
-                        if self.normalize_momentum:
-                            M.div_(coeff_sum)
 
                 with self._phase("newton_schulz"):
                     U = zeropower_via_newtonschulz5(M, steps=self.ns_steps)
-                if not bool(torch.isfinite(U.float()).all().item()):
-                    logger.warning("Skipping non-finite MuZO update for %s block %d", selected.name, block_index)
-                    continue
 
                 with self._phase("apply_update"):
                     U.mul_(math.sqrt(max(int(block.shape[0]), int(block.shape[1]))) * self.muon_scale)
@@ -529,7 +532,7 @@ class MuZOClipOptimizer:
                     fused_perturb_inplace_rademacher(
                         block,
                         base_seed=seed,
-                        param_hash=param_hash64(selected.name, tuple(block.shape)),
+                        param_hash=param_hash64(selected.name, tuple(selected.param.shape)),
                         block_index=block_index,
                         scale=scale,
                     )
